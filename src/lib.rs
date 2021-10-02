@@ -8,10 +8,16 @@ use std::{
   marker::PhantomData,
   mem, ptr,
   sync::{
-    atomic::{self, AtomicIsize, Ordering},
+    atomic::{self, Ordering},
     Arc,
   },
 };
+
+#[cfg(loom)]
+pub(crate) use loom::sync::atomic::AtomicIsize;
+
+#[cfg(not(loom))]
+pub(crate) use std::sync::atomic::AtomicIsize;
 
 // Marker flag to designate that the buffer has already been swapped
 const BUFFER_SWAPPED: isize = 1 << 0;
@@ -356,5 +362,38 @@ impl<T> Clone for Stealer<T> {
 impl<T> fmt::Debug for Stealer<T> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.pad("Stealer { .. }")
+  }
+}
+
+#[cfg(all(loom, test))]
+mod concurrent_tests {
+  use super::*;
+  use loom::thread;
+  use std::convert::identity;
+
+  #[test]
+  fn test_concurrent_logic() {
+    loom::model(|| {
+      let queue = Worker::new();
+      let stealer = queue.stealer();
+
+      for i in 0..100 {
+        queue.push(i);
+      }
+
+      thread::spawn(move || {
+        let batch = stealer.take_queue();
+        let expected = (0..100).map(identity).collect::<Vec<i32>>();
+        assert_eq!(batch, expected);
+      }).join().unwrap();
+
+      for i in 0..100 {
+        queue.push(i);
+      }
+
+      let batch = queue.take_queue();
+      let expected = (0..100).map(identity).collect::<Vec<i32>>();
+      assert_eq!(batch, expected);
+    });
   }
 }
