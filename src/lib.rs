@@ -236,30 +236,36 @@ impl<T> Worker<T> {
       .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
 
     if slot & BUFFER_SWAPPED == BUFFER_SWAPPED {
-      let buffer = Buffer::alloc(MIN_CAP);
-      self.buffer.replace(buffer);
       let guard = &epoch::pin();
-      let old = self.inner.buffer.swap(
-        Owned::new(buffer).into_shared(guard),
-        Ordering::Release,
-        guard,
-      );
 
-      unsafe {
-        // Destroy the old buffer later.
-        guard.defer_unchecked(move || old.into_owned().into_box().dealloc());
-      }
+      // Replacement was already swapped in
+      let buffer = unsafe {
+        self
+          .inner
+          .buffer
+          .load(Ordering::Relaxed, &guard)
+          .deref()
+          .to_owned()
+      };
+
+      self.buffer.replace(buffer);
 
       atomic::fence(Ordering::Release);
 
-      self.inner.slot.store(1 << FLAGS_SHIFT, Ordering::Relaxed);
-
-      // Write `task` into the slot.
-      unsafe {
-        buffer.write(0, task);
+      match self.inner.slot.compare_exchange(
+        slot,
+        1 << FLAGS_SHIFT,
+        Ordering::Acquire,
+        Ordering::Relaxed,
+      ) {
+        Ok(_) => {
+          unsafe {
+            buffer.write(0, task);
+          }
+          0
+        }
+        Err(_) => self.push(task),
       }
-
-      0
     } else {
       let slot = slot >> FLAGS_SHIFT;
       let mut buffer = self.buffer.get();
@@ -329,7 +335,7 @@ impl<T> Stealer<T> {
     let slot = self.inner.slot.fetch_or(BUFFER_SWAPPED, Ordering::Relaxed);
 
     // Buffer was previously taken
-    if slot & BUFFER_SWAPPED == BUFFER_SWAPPED {
+    if slot & BUFFER_SWAPPED == BUFFER_SWAPPED || slot == 0 {
       return vec![];
     }
 
@@ -415,17 +421,15 @@ mod concurrent_tests {
         })
         .collect();
 
-      for i in 0..100 {
+      for i in 0..50 {
         queue.push(i);
       }
 
-      let received_len: std::thread::Result<usize> = threads
-        .into_iter()
-        .map(|thread| thread.join())
-        .sum();
+      let received_len: std::thread::Result<usize> =
+        threads.into_iter().map(|thread| thread.join()).sum();
 
       let batch = queue.take_queue();
-      assert_eq!(received_len.unwrap() + batch.len(), 100);
+      assert_eq!(received_len.unwrap() + batch.len(), 50);
     });
   }
 
@@ -445,10 +449,8 @@ mod concurrent_tests {
         })
         .collect();
 
-      let received_len: std::thread::Result<usize> = threads
-        .into_iter()
-        .map(|thread| thread.join())
-        .sum();
+      let received_len: std::thread::Result<usize> =
+        threads.into_iter().map(|thread| thread.join()).sum();
 
       assert_eq!(received_len.unwrap(), 0);
     });
