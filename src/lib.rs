@@ -385,7 +385,9 @@ mod concurrent_tests {
         let batch = stealer.take_queue();
         let expected = (0..100).map(identity).collect::<Vec<i32>>();
         assert_eq!(batch, expected);
-      }).join().unwrap();
+      })
+      .join()
+      .unwrap();
 
       for i in 0..100 {
         queue.push(i);
@@ -394,6 +396,61 @@ mod concurrent_tests {
       let batch = queue.take_queue();
       let expected = (0..100).map(identity).collect::<Vec<i32>>();
       assert_eq!(batch, expected);
+    });
+  }
+
+  #[test]
+  fn test_multi_stealer() {
+    loom::model(|| {
+      let queue = Worker::new();
+      let stealer = queue.stealer();
+
+      let threads: Vec<_> = (0..2)
+        .map(|_| {
+          let stealer = stealer.clone();
+          thread::spawn(move || {
+            let batch = stealer.take_queue();
+            batch.len()
+          })
+        })
+        .collect();
+
+      for i in 0..100 {
+        queue.push(i);
+      }
+
+      let received_len: std::thread::Result<usize> = threads
+        .into_iter()
+        .map(|thread| thread.join())
+        .sum();
+
+      let batch = queue.take_queue();
+      assert_eq!(received_len.unwrap() + batch.len(), 100);
+    });
+  }
+
+  #[test]
+  fn test_empty() {
+    loom::model(|| {
+      let queue: Worker<i32> = Worker::new();
+      let stealer = queue.stealer();
+
+      let threads: Vec<_> = (0..2)
+        .map(|_| {
+          let stealer = stealer.clone();
+          thread::spawn(move || {
+            let batch = stealer.take_queue();
+            batch.len()
+          })
+        })
+        .collect();
+
+      let received_len: std::thread::Result<usize> = threads
+        .into_iter()
+        .map(|thread| thread.join())
+        .sum();
+
+      assert_eq!(received_len.unwrap(), 0);
     });
   }
 }
