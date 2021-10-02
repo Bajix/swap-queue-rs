@@ -236,6 +236,10 @@ impl<T> Worker<T> {
       .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
 
     if slot & BUFFER_SWAPPED == BUFFER_SWAPPED {
+      self
+      .inner
+      .slot
+      .fetch_sub(1 << FLAGS_SHIFT, Ordering::Relaxed);
       let guard = &epoch::pin();
 
       // Replacement was already swapped in
@@ -264,7 +268,9 @@ impl<T> Worker<T> {
           }
           0
         }
-        Err(_) => self.push(task),
+        Err(_) => {
+          self.push(task)
+        }
       }
     } else {
       let slot = slot >> FLAGS_SHIFT;

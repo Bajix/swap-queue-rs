@@ -2,7 +2,7 @@
 authors = ["Thomas Sieverding <Thomas@bajix.com>"]
 edition = "2021"
 name = "swap-queue"
-version = "0.0.3-beta.1"
+version = "0.0.3"
 description = "A lockfree thread-owned queue whereby tasks are taken by threadsafe stealers in entirety via buffer swapping instead of task popping"
 readme = "./README.md"
 license = "MIT"
