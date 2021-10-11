@@ -306,14 +306,18 @@ impl<T> Worker<T> {
 
     let slot = slot >> FLAGS_SHIFT;
 
+    let buffer = Buffer::alloc(MIN_CAP);
+
     let guard = &epoch::pin();
 
-    let old = {
-      self
-        .inner
-        .buffer
-        .swap(Shared::null(), Ordering::SeqCst, guard)
-    };
+    let new = Owned::new(buffer).into_shared(guard);
+
+    let old = { self.inner.buffer.swap(new, Ordering::SeqCst, guard) };
+
+    self.buffer.set(buffer);
+
+    self.inner.length.store(0, Ordering::Release);
+    self.inner.slot.store(0, Ordering::Release);
 
     unsafe {
       let old = old.into_owned();
