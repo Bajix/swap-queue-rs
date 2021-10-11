@@ -221,7 +221,7 @@ impl<T> Worker<T> {
     let slot = self
       .inner
       .slot
-      .fetch_add(1 << FLAGS_SHIFT, Ordering::Acquire);
+      .fetch_add(1 << FLAGS_SHIFT, Ordering::AcqRel);
 
     if slot & BUFFER_SWAPPED == BUFFER_SWAPPED {
       let buffer = if slot >> FLAGS_SHIFT == 0 {
@@ -297,7 +297,7 @@ impl<T> Worker<T> {
 
   /// Take the entire queue via swapping the underlying buffer and converting into a `Vec<T>`
   pub fn take_queue(&self) -> Vec<T> {
-    let slot = self.inner.slot.fetch_or(BUFFER_SWAPPED, Ordering::Acquire);
+    let slot = self.inner.slot.fetch_or(BUFFER_SWAPPED, Ordering::AcqRel);
 
     // Buffer already taken; no new pushes
     if slot == 0 || slot & BUFFER_SWAPPED == BUFFER_SWAPPED {
@@ -312,7 +312,7 @@ impl<T> Worker<T> {
       self
         .inner
         .buffer
-        .swap(Shared::null(), Ordering::Release, guard)
+        .swap(Shared::null(), Ordering::SeqCst, guard)
     };
 
     unsafe {
@@ -344,7 +344,7 @@ unsafe impl<T: Send> Sync for Stealer<T> {}
 impl<T> Stealer<T> {
   /// Take the entire queue via swapping the underlying buffer and converting into a `Vec<T>`
   pub fn take_queue(&self) -> Vec<T> {
-    let slot = self.inner.slot.fetch_or(BUFFER_SWAPPED, Ordering::Acquire);
+    let slot = self.inner.slot.fetch_or(BUFFER_SWAPPED, Ordering::AcqRel);
 
     // Buffer already taken; no new pushes
     if slot == 0 || slot & BUFFER_SWAPPED == BUFFER_SWAPPED {
@@ -369,7 +369,7 @@ impl<T> Stealer<T> {
     let old = self
       .inner
       .buffer
-      .swap(Shared::null(), Ordering::Release, guard);
+      .swap(Shared::null(), Ordering::AcqRel, guard);
 
     unsafe {
       let old = old.into_owned();
