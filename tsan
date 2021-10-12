@@ -1,0 +1,4 @@
+# TSAN suppressions file for swap_queue
+
+# The epoch-based GC uses fences. See https://github.com/crossbeam-rs/crossbeam/issues/589
+race:crossbeam_epoch
