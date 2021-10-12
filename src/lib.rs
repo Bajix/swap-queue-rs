@@ -90,14 +90,16 @@ struct Inner<T> {
 
 impl<T> Drop for Inner<T> {
   fn drop(&mut self) {
-    let length = self.length.load(Ordering::Relaxed);
+    let slot = self.slot.load(Ordering::Relaxed);
 
-    unsafe {
-      let buffer = self.buffer.load(Ordering::Relaxed, epoch::unprotected());
+    if slot & BUFFER_SWAPPED == 0 {
+      let slot = slot >> FLAGS_SHIFT;
 
-      if !buffer.is_null() {
+      unsafe {
+        let buffer = self.buffer.load(Ordering::Relaxed, epoch::unprotected());
+
         // Go through the buffer from front to back and drop all tasks in the queue.
-        for i in 0..length {
+        for i in 0..slot {
           buffer.deref().at(i).drop_in_place();
         }
 
