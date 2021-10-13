@@ -401,7 +401,7 @@ impl<T> fmt::Debug for Stealer<T> {
 #[cfg(all(loom, test))]
 mod concurrent_tests {
   use super::*;
-  use loom::thread;
+  use loom::{sync::mpsc::channel, thread};
 
   #[test]
   fn multi_stealer() {
@@ -487,27 +487,28 @@ mod concurrent_tests {
   #[test]
   fn takes_while_pushing() {
     loom::model(|| {
-      let queue = Worker::new();
-      let stealer = queue.stealer();
+      let (tx, rx) = channel::<Stealer<i32>>();
 
-      for i in 0..64 {
-        queue.push(i);
-      }
+      let handles = vec![
+        thread::spawn(move || {
+          let queue = Worker::new();
 
-      let mut handles: Vec<_> = (0..2)
-        .map(|_| {
-          let stealer = stealer.clone();
-          thread::spawn(move || {
-            stealer.take_queue();
-          })
-        })
-        .collect();
+          for i in 0..64 {
+            queue.push(i);
+          }
 
-      handles.push(thread::spawn(move || {
-        for i in 0..100 {
-          queue.push(i);
-        }
-      }));
+          let stealer = queue.stealer();
+          tx.send(stealer).unwrap();
+
+          for i in 0..64 {
+            queue.push(i);
+          }
+        }),
+        thread::spawn(move || {
+          let stealer = rx.recv().unwrap();
+          stealer.take_queue();
+        }),
+      ];
 
       for handle in handles {
         handle.join().unwrap();
