@@ -398,14 +398,29 @@ impl<T> fmt::Debug for Stealer<T> {
   }
 }
 
-#[cfg(all(loom, test))]
-mod concurrent_tests {
+#[cfg(all(test))]
+mod tests {
   use super::*;
+
+  #[cfg(loom)]
   use loom::{sync::mpsc::channel, thread};
+
+  #[cfg(not(loom))]
+  use std::{sync::mpsc::channel, thread};
+
+  macro_rules! model {
+    ($test:block) => {
+      #[cfg(loom)]
+      loom::model(|| $test);
+
+      #[cfg(not(loom))]
+      $test
+    };
+  }
 
   #[test]
   fn multi_stealer() {
-    loom::model(|| {
+    model!({
       let queue = Worker::new();
       let stealer = queue.stealer();
 
@@ -430,7 +445,7 @@ mod concurrent_tests {
 
   #[test]
   fn it_resizes() {
-    loom::model(|| {
+    model!({
       let queue = Worker::new();
 
       for i in 0..256 {
@@ -446,7 +461,7 @@ mod concurrent_tests {
 
   #[test]
   fn stealer_takes() {
-    loom::model(|| {
+    model!({
       let queue = Worker::new();
       let stealer = queue.stealer();
 
@@ -464,7 +479,7 @@ mod concurrent_tests {
 
   #[test]
   fn multi_steals() {
-    loom::model(|| {
+    model!({
       let queue = Worker::new();
       let stealer = queue.stealer();
 
@@ -486,7 +501,7 @@ mod concurrent_tests {
 
   #[test]
   fn takes_while_pushing() {
-    loom::model(|| {
+    model!({
       let (tx, rx) = channel::<Stealer<i32>>();
 
       let handles = vec![

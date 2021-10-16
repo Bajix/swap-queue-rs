@@ -1,0 +1,75 @@
+version: "3"
+
+env:
+  TARGET: x86_64-apple-darwin
+
+sources:
+  - src/**/*.rs
+
+tasks:
+  default:
+    cmds:
+      - task: test-loom
+
+  test:
+    cmds:
+      - task: test-doc
+      - task: test-miri
+      - task: test-loom
+      - task: test-address-sanitizer
+      - task: test-thread-sanitizer
+
+  test-doc:
+    cmds:
+      - cargo test --doc -- --nocapture
+    sources:
+      - src/**/*.rs
+
+  test-miri:
+    cmds:
+      - cargo miri test -Z build-std --target $TARGET -- --nocapture
+    sources:
+      - src/**/*.rs
+    env:
+      MIRIFLAGS: -Zmiri-ignore-leaks
+
+  test-loom:
+    cmds:
+      - cargo test -Z build-std --target $TARGET -- --nocapture
+    sources:
+      - src/**/*.rs
+    env:
+      RUSTFLAGS: --cfg loom
+      ASAN_OPTONS: detect_stack_use_after_return=1
+      LOOM_MAX_PREEMPTIONS: 10
+
+  test-sanitizer:
+    cmds:
+      - task: test-address-sanitizer
+      - task: test-thread-sanitizer
+      - task: test-leak-sanitizer
+
+  test-address-sanitizer:
+    cmds:
+      - cargo test -Z build-std --target $TARGET -- --nocapture
+    sources:
+      - src/**/*.rs
+    ev:
+      RUSTFLAGS: -Z sanitizer=address
+      ASAN_OPTONS: detect_stack_use_after_return=1
+
+  test-thread-sanitizer:
+    cmds:
+      - cargo test -Z build-std --target $TARGET -- --nocapture
+    sources:
+      - src/**/*.rs
+    env:
+      RUSTFLAGS: -Z sanitizer=thread
+
+  test-leak-sanitizer:
+    cmds:
+      - cargo test -Z build-std --target $TARGET -- --nocapture
+    sources:
+      - src/**/*.rs
+    env:
+      RUSTFLAGS: -Z sanitizer=leak
