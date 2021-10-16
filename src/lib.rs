@@ -159,18 +159,19 @@ impl<T> Drop for Inner<T> {
     let slot = self.slot.load(Ordering::Relaxed);
 
     if slot & BUFFER_SWAPPED == 0 {
+      let guard = &epoch::pin();
+      let buffer = self.current_buffer(slot).load(Ordering::Relaxed, guard);
+
       unsafe {
-        let buffer = self
-          .current_buffer(slot)
-          .load(Ordering::Relaxed, epoch::unprotected());
+        guard.defer_unchecked(move || {
+          // Go through the buffer from front to back and drop all tasks in the queue.
+          for i in 0..slot {
+            buffer.deref().at(i).drop_in_place();
+          }
 
-        // Go through the buffer from front to back and drop all tasks in the queue.
-        for i in 0..slot {
-          buffer.deref().at(i).drop_in_place();
-        }
-
-        // Free the memory allocated by the buffer.
-        buffer.into_owned().into_box().dealloc();
+          // Free the memory allocated by the buffer.
+          buffer.into_owned().into_box().dealloc();
+        });
       }
     }
   }
