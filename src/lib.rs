@@ -5,10 +5,10 @@ use crossbeam::{
 use std::{cell::Cell, fmt, marker::PhantomData, mem, ptr, sync::Arc};
 
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicIsize, Ordering};
+use loom::sync::atomic::{self, AtomicIsize, Ordering};
 
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{self, AtomicIsize, Ordering};
 
 #[cfg(loom)]
 use loom::thread;
@@ -16,14 +16,18 @@ use loom::thread;
 #[cfg(not(loom))]
 use std::thread;
 
-// Marker flag to designate that the buffer has already been swapped
-const BUFFER_SWAPPED: isize = 1 << 0;
+// Current buffer index
+const BUFFER_IDX: isize = 1 << 0;
 
-// Designates how many bits are set aside for
-const FLAGS_SHIFT: isize = 1;
+// Marker bit to designate that the buffer has been swapped
+const BUFFER_SWAPPED: isize = 1 << 1;
+
+// Designates how many bits are set aside
+const FLAGS_SHIFT: isize = 2;
 
 // Minimum buffer capacity.
 const MIN_CAP: usize = 64;
+
 // If a buffer of at least this size is retired, thread-local garbage is flushed so that it gets
 // deallocated as soon as possible.
 const FLUSH_THRESHOLD_BYTES: usize = 1 << 10;
@@ -33,6 +37,9 @@ const FLUSH_THRESHOLD_BYTES: usize = 1 << 10;
 /// This is just a pointer to the buffer and its length - dropping an instance of this struct will
 /// *not* deallocate the buffer.
 struct Buffer<T> {
+  /// Slot that represents the base index and buffer idx
+  slot: isize,
+
   /// Pointer to the allocated memory.
   ptr: *mut T,
 
@@ -44,14 +51,14 @@ unsafe impl<T> Send for Buffer<T> {}
 
 impl<T> Buffer<T> {
   /// Allocates a new buffer with the specified capacity.
-  fn alloc(cap: usize) -> Buffer<T> {
+  fn alloc(slot: isize, cap: usize) -> Buffer<T> {
     debug_assert_eq!(cap, cap.next_power_of_two());
 
     let mut v = Vec::with_capacity(cap);
     let ptr = v.as_mut_ptr();
     mem::forget(v);
 
-    Buffer { ptr, cap }
+    Buffer { slot, ptr, cap }
   }
 
   /// Deallocates the buffer.
@@ -74,6 +81,7 @@ impl<T> Buffer<T> {
 impl<T> Clone for Buffer<T> {
   fn clone(&self) -> Buffer<T> {
     Buffer {
+      slot: self.slot,
       ptr: self.ptr,
       cap: self.cap,
     }
@@ -85,7 +93,65 @@ impl<T> Copy for Buffer<T> {}
 struct Inner<T> {
   slot: AtomicIsize,
   length: AtomicIsize,
-  buffer: CachePadded<Atomic<Buffer<T>>>,
+  buffers: (
+    CachePadded<Atomic<Buffer<T>>>,
+    CachePadded<Atomic<Buffer<T>>>,
+  ),
+}
+
+impl<T> Inner<T> {
+  /// Take the entire queue via swapping the underlying buffer and converting into a `Vec<T>`
+  fn take_queue(&self) -> Vec<T> {
+    let slot = self.slot.fetch_or(BUFFER_SWAPPED, Ordering::Relaxed);
+
+    // Buffer already taken; no new pushes
+    if slot >> FLAGS_SHIFT == 0 || slot & BUFFER_SWAPPED == BUFFER_SWAPPED {
+      return vec![];
+    }
+
+    let length = slot >> FLAGS_SHIFT;
+
+    let backoff = Backoff::new();
+
+    // Wait for writes to catch up
+    while (self.length.load(Ordering::Acquire) >> FLAGS_SHIFT).lt(&length) {
+      if backoff.is_completed() {
+        thread::yield_now();
+      } else {
+        backoff.snooze();
+      }
+    }
+
+    let guard = &epoch::pin();
+
+    let buffer = self
+      .current_buffer(slot)
+      .swap(Shared::null(), Ordering::Relaxed, guard);
+
+    unsafe {
+      let Buffer { slot, ptr, cap } = *buffer.as_raw();
+
+      let length = length - (slot >> FLAGS_SHIFT);
+
+      Vec::from_raw_parts(ptr, length as usize, cap)
+    }
+  }
+
+  fn current_buffer(&self, slot: isize) -> &CachePadded<Atomic<Buffer<T>>> {
+    if slot & BUFFER_IDX == 0 {
+      &self.buffers.0
+    } else {
+      &self.buffers.1
+    }
+  }
+
+  fn next_buffer(&self, slot: isize) -> &CachePadded<Atomic<Buffer<T>>> {
+    if slot & BUFFER_IDX == 0 {
+      &self.buffers.1
+    } else {
+      &self.buffers.0
+    }
+  }
 }
 
 impl<T> Drop for Inner<T> {
@@ -93,10 +159,10 @@ impl<T> Drop for Inner<T> {
     let slot = self.slot.load(Ordering::Relaxed);
 
     if slot & BUFFER_SWAPPED == 0 {
-      let slot = slot >> FLAGS_SHIFT;
-
       unsafe {
-        let buffer = self.buffer.load(Ordering::Relaxed, epoch::unprotected());
+        let buffer = self
+          .current_buffer(slot)
+          .load(Ordering::Relaxed, epoch::unprotected());
 
         // Go through the buffer from front to back and drop all tasks in the queue.
         for i in 0..slot {
@@ -157,12 +223,15 @@ impl<T> Worker<T> {
   /// let w = Worker::<i32>::new();
   /// ```
   pub fn new() -> Worker<T> {
-    let buffer = Buffer::alloc(MIN_CAP);
+    let buffer = Buffer::alloc(0, MIN_CAP);
 
     let inner = Arc::new(CachePadded::new(Inner {
       slot: AtomicIsize::new(0),
       length: AtomicIsize::new(0),
-      buffer: CachePadded::new(Atomic::new(buffer)),
+      buffers: (
+        CachePadded::new(Atomic::new(buffer)),
+        CachePadded::new(Atomic::null()),
+      ),
     }));
 
     Worker {
@@ -192,11 +261,11 @@ impl<T> Worker<T> {
 
   /// Resizes the internal buffer to the new capacity of `new_cap`.
   #[cold]
-  unsafe fn resize(&self, new_cap: usize, length: isize) {
+  unsafe fn resize(&self, new_cap: usize, slot: isize, length: isize) {
     let buffer = self.buffer.get();
 
     // Allocate a new buffer and copy data from the old buffer to the new one.
-    let new = Buffer::alloc(new_cap);
+    let new = Buffer::alloc(slot, new_cap);
 
     ptr::copy_nonoverlapping(buffer.at(0), new.at(0), length as usize);
 
@@ -206,7 +275,7 @@ impl<T> Worker<T> {
 
     let old = self
       .inner
-      .buffer
+      .current_buffer(slot)
       .swap(Owned::new(new), Ordering::Release, guard);
 
     guard.defer_unchecked(move || old.into_owned().into_box().dealloc());
@@ -223,64 +292,45 @@ impl<T> Worker<T> {
     let slot = self
       .inner
       .slot
-      .fetch_add(1 << FLAGS_SHIFT, Ordering::AcqRel);
+      .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
 
     if slot & BUFFER_SWAPPED == BUFFER_SWAPPED {
-      let buffer = if slot >> FLAGS_SHIFT == 0 {
-        // Buffer was never swapped out, so use original buffer
-        self.buffer.get()
-      } else {
-        let backoff = Backoff::new();
+      let buffer = Buffer::alloc(slot ^ BUFFER_IDX, MIN_CAP);
 
-        let buffer = Buffer::alloc(MIN_CAP);
+      self.buffer.set(buffer);
 
-        let guard = &epoch::pin();
+      self
+        .inner
+        .next_buffer(slot)
+        .store(Owned::new(buffer), Ordering::Release);
 
-        let mut new = Owned::new(buffer).into_shared(guard);
-
-        loop {
-          new = match self.inner.buffer.compare_exchange_weak(
-            Shared::null(),
-            new,
-            Ordering::Release,
-            Ordering::Relaxed,
-            guard,
-          ) {
-            Ok(_) => {
-              self.buffer.set(buffer);
-              break;
-            }
-            Err(err) => {
-              if backoff.is_completed() {
-                thread::yield_now();
-              } else {
-                backoff.snooze();
-              }
-              err.new
-            }
-          }
-        }
-
-        buffer
-      };
+      self
+        .inner
+        .slot
+        .fetch_xor((1 << FLAGS_SHIFT) - 1, Ordering::Relaxed);
 
       unsafe {
         buffer.write(0, task);
       }
 
-      self.inner.length.store(1, Ordering::Release);
-      self.inner.slot.store(1 << FLAGS_SHIFT, Ordering::Release);
+      atomic::fence(Ordering::Release);
+
+      self
+        .inner
+        .length
+        .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
 
       0
     } else {
-      let slot = slot >> FLAGS_SHIFT;
       let mut buffer = self.buffer.get();
 
+      let index = (slot >> FLAGS_SHIFT) - (buffer.slot >> FLAGS_SHIFT);
+
       // Is the queue full?
-      if slot >= buffer.cap as isize {
+      if index >= buffer.cap as isize {
         // Yes. Grow the underlying buffer.
         unsafe {
-          self.resize(2 * buffer.cap, slot);
+          self.resize(2 * buffer.cap, buffer.slot, index);
         }
 
         buffer = self.buffer.get();
@@ -288,43 +338,23 @@ impl<T> Worker<T> {
 
       // Write `task` into the slot.
       unsafe {
-        buffer.write(slot, task);
+        buffer.write(index, task);
       }
 
-      self.inner.length.store(slot + 1, Ordering::Release);
+      atomic::fence(Ordering::Release);
 
-      slot
+      self
+        .inner
+        .length
+        .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
+
+      index
     }
   }
 
   /// Take the entire queue via swapping the underlying buffer and converting into a `Vec<T>`
   pub fn take_queue(&self) -> Vec<T> {
-    let slot = self.inner.slot.fetch_or(BUFFER_SWAPPED, Ordering::AcqRel);
-
-    // Buffer already taken; no new pushes
-    if slot == 0 || slot & BUFFER_SWAPPED == BUFFER_SWAPPED {
-      return vec![];
-    }
-
-    let slot = slot >> FLAGS_SHIFT;
-
-    let buffer = Buffer::alloc(MIN_CAP);
-
-    let guard = &epoch::pin();
-
-    let new = Owned::new(buffer).into_shared(guard);
-
-    let old = { self.inner.buffer.swap(new, Ordering::SeqCst, guard) };
-
-    self.buffer.set(buffer);
-
-    self.inner.length.store(0, Ordering::Release);
-    self.inner.slot.store(0, Ordering::Release);
-
-    unsafe {
-      let old = old.into_owned();
-      Vec::from_raw_parts(old.ptr, slot as usize, old.cap)
-    }
+    self.inner.take_queue()
   }
 }
 
@@ -350,37 +380,7 @@ unsafe impl<T: Send> Sync for Stealer<T> {}
 impl<T> Stealer<T> {
   /// Take the entire queue via swapping the underlying buffer and converting into a `Vec<T>`
   pub fn take_queue(&self) -> Vec<T> {
-    let slot = self.inner.slot.fetch_or(BUFFER_SWAPPED, Ordering::AcqRel);
-
-    // Buffer already taken; no new pushes
-    if slot == 0 || slot & BUFFER_SWAPPED == BUFFER_SWAPPED {
-      return vec![];
-    }
-
-    let slot = slot >> FLAGS_SHIFT;
-
-    let backoff = Backoff::new();
-
-    // Wait for writes to catch up
-    while self.inner.length.load(Ordering::Acquire).lt(&slot) {
-      if backoff.is_completed() {
-        thread::yield_now();
-      } else {
-        backoff.snooze();
-      }
-    }
-
-    let guard = &epoch::pin();
-
-    let old = self
-      .inner
-      .buffer
-      .swap(Shared::null(), Ordering::AcqRel, guard);
-
-    unsafe {
-      let old = old.into_owned();
-      Vec::from_raw_parts(old.ptr, slot as usize, old.cap)
-    }
+    self.inner.take_queue()
   }
 }
 
