@@ -1,43 +1,37 @@
 use crossbeam::{
   epoch::{self, Atomic, Owned, Shared},
-  utils::{Backoff, CachePadded},
+  utils::CachePadded,
 };
+use oneshot::{channel, Receiver, Sender};
 use std::{cell::Cell, fmt, marker::PhantomData, mem, ptr, sync::Arc};
 
 #[cfg(loom)]
-use loom::sync::atomic::{self, AtomicIsize, Ordering};
+use loom::sync::atomic::{AtomicIsize, Ordering};
 
 #[cfg(not(loom))]
-use std::sync::atomic::{self, AtomicIsize, Ordering};
-
-#[cfg(loom)]
-use loom::thread;
-
-#[cfg(not(loom))]
-use std::thread;
+use std::sync::atomic::{AtomicIsize, Ordering};
 
 // Current buffer index
 const BUFFER_IDX: isize = 1 << 0;
 
-// Marker bit to designate that the buffer has been swapped
-const BUFFER_SWAPPED: isize = 1 << 1;
+// Designates that write is in progress
+const WRITE_IN_PROGRESS: isize = 1 << 1;
 
-// Designates how many bits are set aside
-const FLAGS_SHIFT: isize = 2;
+// Designates how many bits are set aside for flags
+const FLAGS_SHIFT: isize = 1;
+
+// Slot increments both for reads and writes, therefore we shift slot an extra bit to extract length
+const LENGTH_SHIFT: isize = FLAGS_SHIFT + 1;
 
 // Minimum buffer capacity.
 const MIN_CAP: usize = 64;
-
-// If a buffer of at least this size is retired, thread-local garbage is flushed so that it gets
-// deallocated as soon as possible.
-const FLUSH_THRESHOLD_BYTES: usize = 1 << 10;
 
 /// A buffer that holds tasks in a worker queue.
 ///
 /// This is just a pointer to the buffer and its length - dropping an instance of this struct will
 /// *not* deallocate the buffer.
 struct Buffer<T> {
-  /// Slot that represents the base index and buffer idx
+  /// Slot that represents the index offset and buffer idx
   slot: isize,
 
   /// Pointer to the allocated memory.
@@ -76,6 +70,11 @@ impl<T> Buffer<T> {
   unsafe fn write(&self, index: isize, task: T) {
     ptr::write_volatile(self.at(index), task)
   }
+
+  unsafe fn to_vec(self, length: usize) -> Vec<T> {
+    let Buffer { ptr, cap, .. } = self;
+    Vec::from_raw_parts(ptr, length, cap)
+  }
 }
 
 impl<T> Clone for Buffer<T> {
@@ -92,7 +91,6 @@ impl<T> Copy for Buffer<T> {}
 
 struct Inner<T> {
   slot: AtomicIsize,
-  length: AtomicIsize,
   buffers: (
     CachePadded<Atomic<Buffer<T>>>,
     CachePadded<Atomic<Buffer<T>>>,
@@ -100,77 +98,37 @@ struct Inner<T> {
 }
 
 impl<T> Inner<T> {
-  /// Take the entire queue via swapping the underlying buffer and converting into a `Vec<T>`
-  fn take_queue(&self) -> Vec<T> {
-    let slot = self.slot.fetch_or(BUFFER_SWAPPED, Ordering::Relaxed);
-
-    // Buffer already taken; no new pushes
-    if slot >> FLAGS_SHIFT == 0 || slot & BUFFER_SWAPPED == BUFFER_SWAPPED {
-      return vec![];
-    }
-
-    let length = slot >> FLAGS_SHIFT;
-
-    let backoff = Backoff::new();
-
-    // Wait for writes to catch up
-    while (self.length.load(Ordering::Acquire) >> FLAGS_SHIFT).lt(&length) {
-      if backoff.is_completed() {
-        thread::yield_now();
-      } else {
-        backoff.snooze();
-      }
-    }
-
-    let guard = &epoch::pin();
-
-    let buffer = self
-      .current_buffer(slot)
-      .swap(Shared::null(), Ordering::Relaxed, guard);
-
-    unsafe {
-      let Buffer { slot, ptr, cap } = *buffer.as_raw();
-
-      let length = length - (slot >> FLAGS_SHIFT);
-
-      Vec::from_raw_parts(ptr, length as usize, cap)
-    }
-  }
-
-  fn current_buffer(&self, slot: isize) -> &CachePadded<Atomic<Buffer<T>>> {
+  fn get_buffer(&self, slot: isize) -> &CachePadded<Atomic<Buffer<T>>> {
     if slot & BUFFER_IDX == 0 {
       &self.buffers.0
     } else {
       &self.buffers.1
-    }
-  }
-
-  fn next_buffer(&self, slot: isize) -> &CachePadded<Atomic<Buffer<T>>> {
-    if slot & BUFFER_IDX == 0 {
-      &self.buffers.1
-    } else {
-      &self.buffers.0
     }
   }
 }
 
 impl<T> Drop for Inner<T> {
   fn drop(&mut self) {
-    let slot = self.slot.load(Ordering::Relaxed);
+    let slot = self.slot.load(Ordering::Acquire);
 
-    if slot & BUFFER_SWAPPED == 0 {
-      let guard = &epoch::pin();
-      let buffer = self.current_buffer(slot).load(Ordering::Relaxed, guard);
+    let guard = &epoch::pin();
+    let buffer = self
+      .get_buffer(slot)
+      .swap(Shared::null(), Ordering::Acquire, guard);
 
+    if !buffer.is_null() {
       unsafe {
         guard.defer_unchecked(move || {
+          let buffer = *buffer.into_owned();
+          let length = (slot >> LENGTH_SHIFT) - (buffer.slot >> LENGTH_SHIFT);
+
           // Go through the buffer from front to back and drop all tasks in the queue.
-          for i in 0..slot {
-            buffer.deref().at(i).drop_in_place();
+          for i in 0..length {
+            buffer.at(i).drop_in_place();
           }
 
           // Free the memory allocated by the buffer.
-          buffer.into_owned().into_box().dealloc();
+          buffer.dealloc();
         });
       }
     }
@@ -187,17 +145,15 @@ impl<T> Drop for Inner<T> {
 /// use swap_queue::Worker;
 ///
 /// let w = Worker::new();
-/// let s = w.stealer();
-///
-/// w.push(1);
+/// let s = w.push(1).unwrap();
 /// w.push(2);
 /// w.push(3);
-/// assert_eq!(s.take_queue(), vec![1, 2, 3]);
+/// assert_eq!(s.take_blocking(), vec![1, 2, 3]);
 ///
-/// w.push(4);
+/// let s = w.push(4).unwrap();
 /// w.push(5);
 /// w.push(6);
-/// assert_eq!(s.take_queue(), vec![4, 5, 6]);
+/// assert_eq!(s.take_blocking(), vec![4, 5, 6]);
 /// ```
 
 pub struct Worker<T> {
@@ -205,6 +161,8 @@ pub struct Worker<T> {
   inner: Arc<CachePadded<Inner<T>>>,
   /// A copy of `inner.buffer` for quick access.
   buffer: Cell<Buffer<T>>,
+  /// Send handle corresponding to the current Stealer
+  tx: Cell<Option<Sender<Vec<T>>>>,
   /// Indicates that the worker cannot be shared among threads.
   _marker: PhantomData<*mut ()>,
 }
@@ -228,7 +186,6 @@ impl<T> Worker<T> {
 
     let inner = Arc::new(CachePadded::new(Inner {
       slot: AtomicIsize::new(0),
-      length: AtomicIsize::new(0),
       buffers: (
         CachePadded::new(Atomic::new(buffer)),
         CachePadded::new(Atomic::null()),
@@ -238,124 +195,101 @@ impl<T> Worker<T> {
     Worker {
       inner,
       buffer: Cell::new(buffer),
+      tx: Cell::new(None),
       _marker: PhantomData,
     }
   }
 
-  /// Creates a stealer for this queue.
-  ///
-  /// The returned stealer can be shared among threads and cloned.
-  ///
-  /// # Examples
-  ///
-  /// ```
-  /// use swap_queue::Worker;
-  ///
-  /// let w = Worker::<i32>::new();
-  /// let s = w.stealer();
-  /// ```
-  pub fn stealer(&self) -> Stealer<T> {
-    Stealer {
-      inner: self.inner.clone(),
-    }
-  }
-
   /// Resizes the internal buffer to the new capacity of `new_cap`.
-  #[cold]
-  unsafe fn resize(&self, new_cap: usize, slot: isize, length: isize) {
-    let buffer = self.buffer.get();
+  unsafe fn resize(&self, buffer: &mut Buffer<T>, slot: isize) {
+    let length = (slot >> LENGTH_SHIFT) - (buffer.slot >> LENGTH_SHIFT);
 
     // Allocate a new buffer and copy data from the old buffer to the new one.
-    let new = Buffer::alloc(slot, new_cap);
+    let new = Buffer::alloc(buffer.slot, buffer.cap * 2);
 
     ptr::copy_nonoverlapping(buffer.at(0), new.at(0), length as usize);
 
-    let guard = &epoch::pin();
-
     self.buffer.set(new);
 
-    let old = self
+    let old = std::mem::replace(buffer, new);
+
+    self
       .inner
-      .current_buffer(slot)
-      .swap(Owned::new(new), Ordering::Release, guard);
+      .get_buffer(slot)
+      .store(Owned::new(new), Ordering::Release);
 
-    guard.defer_unchecked(move || old.into_owned().into_box().dealloc());
-
-    // If the buffer is very large, then flush the thread-local garbage in order to deallocate
-    // it as soon as possible.
-    if mem::size_of::<T>() * new_cap >= FLUSH_THRESHOLD_BYTES {
-      guard.flush();
-    }
+    old.dealloc();
   }
 
-  /// Push a task to the queue and returns the index written to
-  pub fn push(&self, task: T) -> isize {
+  /// Push a task to the queue and returns a Stealer if empty
+  pub fn push(&self, task: T) -> Option<Stealer<T>> {
     let slot = self
       .inner
       .slot
       .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
 
-    if slot & BUFFER_SWAPPED == BUFFER_SWAPPED {
-      let buffer = Buffer::alloc(slot ^ BUFFER_IDX, MIN_CAP);
+    let idx = slot & BUFFER_IDX;
 
-      self.buffer.set(buffer);
+    let mut buffer = self.buffer.get();
 
-      self
-        .inner
-        .next_buffer(slot)
-        .store(Owned::new(buffer), Ordering::Release);
-
-      self
-        .inner
-        .slot
-        .fetch_xor((1 << FLAGS_SHIFT) - 1, Ordering::Relaxed);
-
-      unsafe {
-        buffer.write(0, task);
-      }
-
-      atomic::fence(Ordering::Release);
-
-      self
-        .inner
-        .length
-        .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
-
-      0
-    } else {
-      let mut buffer = self.buffer.get();
-
-      let index = (slot >> FLAGS_SHIFT) - (buffer.slot >> FLAGS_SHIFT);
+    // Is buffer still current?
+    let index = if idx == buffer.slot & BUFFER_IDX {
+      let index = (slot >> LENGTH_SHIFT) - (buffer.slot >> LENGTH_SHIFT);
 
       // Is the queue full?
       if index >= buffer.cap as isize {
         // Yes. Grow the underlying buffer.
         unsafe {
-          self.resize(2 * buffer.cap, buffer.slot, index);
+          self.resize(&mut buffer, slot);
         }
-
-        buffer = self.buffer.get();
       }
 
-      // Write `task` into the slot.
-      unsafe {
-        buffer.write(index, task);
-      }
-
-      atomic::fence(Ordering::Release);
+      index
+    } else {
+      buffer = Buffer::alloc(slot, buffer.cap);
 
       self
         .inner
-        .length
-        .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
+        .get_buffer(slot)
+        .store(Owned::new(buffer), Ordering::Release);
 
-      index
+      self.buffer.set(buffer);
+
+      0
+    };
+
+    unsafe {
+      buffer.write(index, task);
     }
-  }
 
-  /// Take the entire queue via swapping the underlying buffer and converting into a `Vec<T>`
-  pub fn take_queue(&self) -> Vec<T> {
-    self.inner.take_queue()
+    let slot = self
+      .inner
+      .slot
+      .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
+
+    // If the buffer idx was swapped by the stealer while a write is in progress, then it is waiting on receive
+    if idx != slot & BUFFER_IDX {
+      let (tx, rx) = channel();
+      let tx = self.tx.replace(Some(tx)).unwrap();
+
+      // Send buffer as vec to receiver
+      tx.send(unsafe { buffer.to_vec(index as usize) }).ok();
+
+      Some(Stealer {
+        rx,
+        inner: self.inner.clone(),
+      })
+    } else if index == 0 {
+      let (tx, rx) = channel();
+      self.tx.set(Some(tx));
+
+      Some(Stealer {
+        rx,
+        inner: self.inner.clone(),
+      })
+    } else {
+      None
+    }
   }
 }
 
@@ -371,6 +305,8 @@ impl<T> fmt::Debug for Worker<T> {
   }
 }
 pub struct Stealer<T> {
+  /// Buffer receiver to be used when waiting on writes
+  rx: Receiver<Vec<T>>,
   /// A reference to the inner representation of the queue.
   inner: Arc<CachePadded<Inner<T>>>,
 }
@@ -380,15 +316,50 @@ unsafe impl<T: Send> Sync for Stealer<T> {}
 
 impl<T> Stealer<T> {
   /// Take the entire queue via swapping the underlying buffer and converting into a `Vec<T>`
-  pub fn take_queue(&self) -> Vec<T> {
-    self.inner.take_queue()
-  }
-}
+  pub async fn take(self) -> Vec<T> {
+    let Stealer { rx, inner } = self;
 
-impl<T> Clone for Stealer<T> {
-  fn clone(&self) -> Stealer<T> {
-    Stealer {
-      inner: self.inner.clone(),
+    let slot = inner.slot.fetch_xor(BUFFER_IDX, Ordering::Relaxed);
+
+    // Worker will see the buffer has swapped when confirming length increment
+    if slot & WRITE_IN_PROGRESS == WRITE_IN_PROGRESS {
+      // Writer can never be dropped mid-write, therefore RecvError cannot occur
+      rx.await.unwrap()
+    } else {
+      let guard = &epoch::pin();
+
+      let buffer = inner
+        .get_buffer(slot)
+        .swap(Shared::null(), Ordering::Acquire, guard);
+
+      unsafe {
+        let buffer = *buffer.into_owned();
+        buffer.to_vec(((slot >> LENGTH_SHIFT) - (buffer.slot >> LENGTH_SHIFT)) as usize)
+      }
+    }
+  }
+
+  /// Take the entire queue via swapping the underlying buffer and converting into a `Vec<T>`, blocking only if write in progress
+  pub fn take_blocking(self) -> Vec<T> {
+    let Stealer { rx, inner } = self;
+
+    let slot = inner.slot.fetch_xor(BUFFER_IDX, Ordering::Relaxed);
+
+    // Worker will see the buffer has swapped when confirming length increment
+    if slot & WRITE_IN_PROGRESS == WRITE_IN_PROGRESS {
+      // Writer can never be dropped mid-write, therefore RecvError cannot occur
+      rx.recv().unwrap()
+    } else {
+      let guard = &epoch::pin();
+
+      let buffer = inner
+        .get_buffer(slot)
+        .swap(Shared::null(), Ordering::Acquire, guard);
+
+      unsafe {
+        let buffer = *buffer.into_owned();
+        buffer.to_vec(((slot >> LENGTH_SHIFT) - (buffer.slot >> LENGTH_SHIFT)) as usize)
+      }
     }
   }
 }
@@ -420,40 +391,16 @@ mod tests {
   }
 
   #[test]
-  fn multi_stealer() {
-    model!({
-      let queue = Worker::new();
-      let stealer = queue.stealer();
-
-      for i in 0..50 {
-        queue.push(i);
-      }
-
-      let threads = (0..2).map(|_| {
-        let stealer = stealer.clone();
-        thread::spawn(move || {
-          let batch = stealer.take_queue();
-          batch.len()
-        })
-      });
-
-      let received_len: std::thread::Result<usize> =
-        threads.into_iter().map(|thread| thread.join()).sum();
-
-      assert_eq!(received_len.unwrap(), 50);
-    });
-  }
-
-  #[test]
   fn it_resizes() {
     model!({
       let queue = Worker::new();
+      let stealer = queue.push(0).unwrap();
 
-      for i in 0..256 {
+      for i in 1..256 {
         queue.push(i);
       }
 
-      let batch = queue.take_queue();
+      let batch = stealer.take_blocking();
       let expected = (0..256).collect::<Vec<i32>>();
 
       assert_eq!(batch, expected);
@@ -464,39 +411,17 @@ mod tests {
   fn stealer_takes() {
     model!({
       let queue = Worker::new();
-      let stealer = queue.stealer();
+      let stealer = queue.push(0).unwrap();
 
-      for i in 0..100 {
+      for i in 1..100 {
         queue.push(i);
       }
 
       thread::spawn(move || {
-        stealer.take_queue();
+        stealer.take_blocking();
       })
       .join()
       .unwrap();
-    });
-  }
-
-  #[test]
-  fn multi_steals() {
-    model!({
-      let queue = Worker::new();
-      let stealer = queue.stealer();
-
-      for i in 0..128 {
-        queue.push(i);
-      }
-
-      let mut batch = stealer.take_queue();
-
-      for i in 128..256 {
-        queue.push(i);
-      }
-
-      batch.extend(stealer.take_queue());
-
-      assert_eq!(batch, (0..256).collect::<Vec<i32>>());
     });
   }
 
@@ -508,12 +433,12 @@ mod tests {
       let handles = vec![
         thread::spawn(move || {
           let queue = Worker::new();
+          let stealer = queue.push(0).unwrap();
 
-          for i in 0..64 {
+          for i in 1..64 {
             queue.push(i);
           }
 
-          let stealer = queue.stealer();
           tx.send(stealer).unwrap();
 
           for i in 0..64 {
@@ -522,7 +447,7 @@ mod tests {
         }),
         thread::spawn(move || {
           let stealer = rx.recv().unwrap();
-          stealer.take_queue();
+          stealer.take_blocking();
         }),
       ];
 
