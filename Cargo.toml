@@ -12,7 +12,8 @@ repository = "https://github.com/Bajix/swap-queue-rs/"
 
 [dependencies]
 crossbeam = "0.8.1"
-oneshot = "0.1.2"
+futures = "0.3.17"
+tokio = { version = "1", features = ["sync", "rt"] }
 
 [target.'cfg(loom)'.dependencies]
 loom = "0.5.2"

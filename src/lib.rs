@@ -2,8 +2,9 @@ use crossbeam::{
   epoch::{self, Atomic, Owned, Shared},
   utils::CachePadded,
 };
-use oneshot::{channel, Receiver, Sender};
+use futures::executor::block_on;
 use std::{cell::Cell, fmt, marker::PhantomData, mem, ptr, sync::Arc};
+use tokio::sync::oneshot::{channel, Receiver, Sender};
 
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicIsize, Ordering};
@@ -346,9 +347,10 @@ impl<T> Stealer<T> {
     let slot = inner.slot.fetch_xor(BUFFER_IDX, Ordering::Relaxed);
 
     // Worker will see the buffer has swapped when confirming length increment
+    // It's not possible for this to be write in progress when called from the same thread as the queue
     if slot & WRITE_IN_PROGRESS == WRITE_IN_PROGRESS {
       // Writer can never be dropped mid-write, therefore RecvError cannot occur
-      rx.recv().unwrap()
+      block_on(rx).unwrap()
     } else {
       let guard = &epoch::pin();
 
@@ -375,10 +377,10 @@ mod tests {
   use super::*;
 
   #[cfg(loom)]
-  use loom::{sync::mpsc::channel, thread};
+  use loom::thread;
 
   #[cfg(not(loom))]
-  use std::{sync::mpsc::channel, thread};
+  use std::thread;
 
   macro_rules! model {
     ($test:block) => {
@@ -396,12 +398,12 @@ mod tests {
       let queue = Worker::new();
       let stealer = queue.push(0).unwrap();
 
-      for i in 1..256 {
+      for i in 1..128 {
         queue.push(i);
       }
 
       let batch = stealer.take_blocking();
-      let expected = (0..256).collect::<Vec<i32>>();
+      let expected = (0..128).collect::<Vec<i32>>();
 
       assert_eq!(batch, expected);
     });
@@ -413,7 +415,7 @@ mod tests {
       let queue = Worker::new();
       let stealer = queue.push(0).unwrap();
 
-      for i in 1..100 {
+      for i in 1..128 {
         queue.push(i);
       }
 
@@ -422,38 +424,6 @@ mod tests {
       })
       .join()
       .unwrap();
-    });
-  }
-
-  #[test]
-  fn takes_while_pushing() {
-    model!({
-      let (tx, rx) = channel::<Stealer<i32>>();
-
-      let handles = vec![
-        thread::spawn(move || {
-          let queue = Worker::new();
-          let stealer = queue.push(0).unwrap();
-
-          for i in 1..64 {
-            queue.push(i);
-          }
-
-          tx.send(stealer).unwrap();
-
-          for i in 0..64 {
-            queue.push(i);
-          }
-        }),
-        thread::spawn(move || {
-          let stealer = rx.recv().unwrap();
-          stealer.take_blocking();
-        }),
-      ];
-
-      for handle in handles {
-        handle.join().unwrap();
-      }
     });
   }
 }
