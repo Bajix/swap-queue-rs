@@ -413,8 +413,24 @@ mod tests {
     });
   }
 
+  #[cfg(not(loom))]
+  #[tokio::test]
+  async fn stealer_takes() {
+    let queue = Worker::new();
+    let stealer = queue.push(0).unwrap();
+
+    for i in 1..1024 {
+      queue.push(i);
+    }
+
+    let batch = stealer.take().await;
+    let expected = (0..1024).collect::<Vec<i32>>();
+
+    assert_eq!(batch, expected);
+  }
+
   #[test]
-  fn stealer_takes() {
+  fn stealer_takes_blocking() {
     model!({
       let queue = Worker::new();
       let stealer = queue.push(0).unwrap();
@@ -428,6 +444,44 @@ mod tests {
       })
       .join()
       .unwrap();
+    });
+  }
+
+  #[cfg(not(loom))]
+  #[tokio::test]
+  async fn worker_drops() {
+    let queue = Worker::new();
+    let stealer = queue.push(0).unwrap();
+
+    for i in 1..128 {
+      queue.push(i);
+    }
+
+    drop(queue);
+
+    let batch = stealer.take().await;
+    let expected = (0..128).collect::<Vec<i32>>();
+
+    assert_eq!(batch, expected);
+  }
+
+  #[cfg(loom)]
+  #[tokio::test]
+  async fn worker_drops() {
+    loom::model(|| {
+      let queue = Worker::new();
+      let stealer = queue.push(0).unwrap();
+
+      for i in 1..128 {
+        queue.push(i);
+      }
+
+      drop(queue);
+
+      let batch = stealer.take_blocking();
+      let expected = (0..128).collect::<Vec<i32>>();
+
+      assert_eq!(batch, expected);
     });
   }
 }
