@@ -46,7 +46,8 @@ struct Buffer<T> {
   cap: usize,
 }
 
-unsafe impl<T> Send for Buffer<T> {}
+unsafe impl<T: Send> Send for Buffer<T> {}
+unsafe impl<T: Send> Sync for Buffer<T> {}
 
 impl<T> Buffer<T> {
   /// Allocates a new buffer with the specified capacity.
