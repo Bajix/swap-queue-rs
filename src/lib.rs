@@ -11,22 +11,22 @@ use std::{cell::Cell, fmt, marker::PhantomData, mem, ptr, sync::Arc};
 use tokio::sync::oneshot::{channel, Receiver, Sender};
 
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicIsize, Ordering};
+use loom::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Current buffer index
-const BUFFER_IDX: isize = 1 << 0;
+const BUFFER_IDX: usize = 1 << 0;
 
 // Designates that write is in progress
-const WRITE_IN_PROGRESS: isize = 1 << 1;
+const WRITE_IN_PROGRESS: usize = 1 << 1;
 
 // Designates how many bits are set aside for flags
-const FLAGS_SHIFT: isize = 1;
+const FLAGS_SHIFT: usize = 1;
 
 // Slot increments both for reads and writes, therefore we shift slot an extra bit to extract length
-const LENGTH_SHIFT: isize = FLAGS_SHIFT + 1;
+const LENGTH_SHIFT: usize = FLAGS_SHIFT + 1;
 
 // Minimum buffer capacity.
 const MIN_CAP: usize = 64;
@@ -37,7 +37,7 @@ const MIN_CAP: usize = 64;
 /// *not* deallocate the buffer.
 struct Buffer<T> {
   /// Slot that represents the index offset and buffer idx
-  slot: isize,
+  slot: usize,
 
   /// Pointer to the allocated memory.
   ptr: *mut T,
@@ -51,7 +51,7 @@ unsafe impl<T: Send> Sync for Buffer<T> {}
 
 impl<T> Buffer<T> {
   /// Allocates a new buffer with the specified capacity.
-  fn alloc(slot: isize, cap: usize) -> Buffer<T> {
+  fn alloc(slot: usize, cap: usize) -> Buffer<T> {
     debug_assert_eq!(cap, cap.next_power_of_two());
 
     let mut v = Vec::with_capacity(cap);
@@ -67,13 +67,13 @@ impl<T> Buffer<T> {
   }
 
   /// Returns a pointer to the task at the specified `index`.
-  unsafe fn at(&self, index: isize) -> *mut T {
+  unsafe fn at(&self, index: usize) -> *mut T {
     // `self.cap` is always a power of two.
-    self.ptr.offset(index & (self.cap - 1) as isize)
+    self.ptr.offset((index & (self.cap - 1)) as isize)
   }
 
   /// Writes `task` into the specified `index`.
-  unsafe fn write(&self, index: isize, task: T) {
+  unsafe fn write(&self, index: usize, task: T) {
     ptr::write_volatile(self.at(index), task)
   }
 
@@ -95,8 +95,16 @@ impl<T> Clone for Buffer<T> {
 
 impl<T> Copy for Buffer<T> {}
 
+fn slot_delta(a: usize, b: usize) -> usize {
+  if a < b {
+    ((usize::MAX - b) >> LENGTH_SHIFT) + (a >> LENGTH_SHIFT)
+  } else {
+    (a >> LENGTH_SHIFT) - (b >> LENGTH_SHIFT)
+  }
+}
+
 struct Inner<T> {
-  slot: AtomicIsize,
+  slot: AtomicUsize,
   buffers: (
     CachePadded<Atomic<Buffer<T>>>,
     CachePadded<Atomic<Buffer<T>>>,
@@ -104,7 +112,7 @@ struct Inner<T> {
 }
 
 impl<T> Inner<T> {
-  fn get_buffer(&self, slot: isize) -> &CachePadded<Atomic<Buffer<T>>> {
+  fn get_buffer(&self, slot: usize) -> &CachePadded<Atomic<Buffer<T>>> {
     if slot & BUFFER_IDX == 0 {
       &self.buffers.0
     } else {
@@ -126,7 +134,7 @@ impl<T> Drop for Inner<T> {
       unsafe {
         guard.defer_unchecked(move || {
           let buffer = *buffer.into_owned();
-          let length = (slot >> LENGTH_SHIFT) - (buffer.slot >> LENGTH_SHIFT);
+          let length = slot_delta(slot, buffer.slot);
 
           // Go through the buffer from front to back and drop all tasks in the queue.
           for i in 0..length {
@@ -191,7 +199,7 @@ impl<T> Worker<T> {
     let buffer = Buffer::alloc(0, MIN_CAP);
 
     let inner = Arc::new(CachePadded::new(Inner {
-      slot: AtomicIsize::new(0),
+      slot: AtomicUsize::new(0),
       buffers: (
         CachePadded::new(Atomic::new(buffer)),
         CachePadded::new(Atomic::null()),
@@ -207,13 +215,13 @@ impl<T> Worker<T> {
   }
 
   /// Resizes the internal buffer to the new capacity of `new_cap`.
-  unsafe fn resize(&self, buffer: &mut Buffer<T>, slot: isize) {
-    let length = (slot >> LENGTH_SHIFT) - (buffer.slot >> LENGTH_SHIFT);
+  unsafe fn resize(&self, buffer: &mut Buffer<T>, slot: usize) {
+    let length = slot_delta(slot, buffer.slot);
 
     // Allocate a new buffer and copy data from the old buffer to the new one.
     let new = Buffer::alloc(buffer.slot, buffer.cap * 2);
 
-    ptr::copy_nonoverlapping(buffer.at(0), new.at(0), length as usize);
+    ptr::copy_nonoverlapping(buffer.at(0), new.at(0), length);
 
     self.buffer.set(new);
 
@@ -240,10 +248,10 @@ impl<T> Worker<T> {
 
     // Is buffer still current?
     let index = if idx == buffer.slot & BUFFER_IDX {
-      let index = (slot >> LENGTH_SHIFT) - (buffer.slot >> LENGTH_SHIFT);
+      let index = slot_delta(slot, buffer.slot);
 
       // Is the queue full?
-      if index >= buffer.cap as isize {
+      if index >= buffer.cap {
         // Yes. Grow the underlying buffer.
         unsafe {
           self.resize(&mut buffer, slot);
@@ -279,7 +287,7 @@ impl<T> Worker<T> {
       let tx = self.tx.replace(Some(tx)).unwrap();
 
       // Send buffer as vec to receiver
-      tx.send(unsafe { buffer.to_vec(index as usize) }).ok();
+      tx.send(unsafe { buffer.to_vec(index) }).ok();
 
       Some(Stealer {
         rx,
@@ -340,7 +348,7 @@ impl<T> Stealer<T> {
 
       unsafe {
         let buffer = *buffer.into_owned();
-        buffer.to_vec(((slot >> LENGTH_SHIFT) - (buffer.slot >> LENGTH_SHIFT)) as usize)
+        buffer.to_vec(slot_delta(slot, buffer.slot))
       }
     }
   }
@@ -365,7 +373,7 @@ impl<T> Stealer<T> {
 
       unsafe {
         let buffer = *buffer.into_owned();
-        buffer.to_vec(((slot >> LENGTH_SHIFT) - (buffer.slot >> LENGTH_SHIFT)) as usize)
+        buffer.to_vec(slot_delta(slot, buffer.slot))
       }
     }
   }
@@ -395,6 +403,13 @@ mod tests {
       #[cfg(not(loom))]
       $test
     };
+  }
+
+  #[test]
+  fn slot_wraps_around() {
+    let delta = slot_delta(1 << LENGTH_SHIFT, usize::MAX);
+
+    assert_eq!(delta, 1);
   }
 
   #[test]
