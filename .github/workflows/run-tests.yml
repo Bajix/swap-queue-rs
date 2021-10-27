@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+jobs:
+  # ...
+  tests:
+    name: Test on ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    env:
+      MIRIFLAGS: -Zmiri-ignore-leaks
+      ASAN_OPTONS: detect_stack_use_after_return=1
+      LOOM_MAX_PREEMPTIONS: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          # ARM64 Linux (kernel 4.2, glibc 2.17+) 1
+          - aarch64-unknown-linux-gnu
+        rust: [nightly]
+    steps:
+      - uses: actions/checkout@v2
+      - uses: hecrj/setup-rust-action@v1
+        with:
+          rust-version: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+      - run: sudo apt update
+      - run: sudo apt install build-essential
+      - run: RUSTFLAGS="-Z sanitizer=address" cargo test --target=${{ matrix.target }}
+      - run: RUSTFLAGS="-Z sanitizer=thread" cargo test --target=${{ matrix.target }}
+      - run: RUSTFLAGS="--cfg loom" cargo test --target=${{ matrix.target }}
