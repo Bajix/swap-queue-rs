@@ -7,20 +7,15 @@ on:
       - master
 
 jobs:
-  # ...
-  tests:
-    name: Test on ${{ matrix.target }}
+  test-tsan:
+    name: Test with ThreadSanitizer on ${{ matrix.target }}
     runs-on: ubuntu-latest
-    env:
-      MIRIFLAGS: -Zmiri-ignore-leaks
-      ASAN_OPTONS: detect_stack_use_after_return=1
-      LOOM_MAX_PREEMPTIONS: 10
     strategy:
       fail-fast: false
       matrix:
         target:
-          # ARM64 Linux (kernel 4.2, glibc 2.17+) 1
-          - aarch64-unknown-linux-gnu
+          # 64-bit Linux (kernel 2.6.32+, glibc 2.11+)
+          - x86_64-unknown-linux-gnu
         rust: [nightly]
     steps:
       - uses: actions/checkout@v2
@@ -28,8 +23,65 @@ jobs:
         with:
           rust-version: ${{ matrix.rust }}
           targets: ${{ matrix.target }}
-      - run: sudo apt update
-      - run: sudo apt install build-essential
-      - run: RUSTFLAGS="-Z sanitizer=address" cargo test --target=${{ matrix.target }}
-      - run: RUSTFLAGS="-Z sanitizer=thread" cargo test --target=${{ matrix.target }}
+      - run: rustup component add rust-src --toolchain ${{ matrix.rust }}-${{ matrix.target }}
+      - run: TSAN_OPTIONS="suppressions=$(pwd)/tsan" RUSTFLAGS="-Z sanitizer=thread" cargo test -Z build-std --target=${{ matrix.target }}
+
+  test-lsan:
+    name: Test with LeakSanitizer on ${{ matrix.target }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          # 64-bit macOS (10.7+, Lion+)
+          - x86_64-apple-darwin
+        rust: [nightly]
+    steps:
+      - uses: actions/checkout@v2
+      - uses: hecrj/setup-rust-action@v1
+        with:
+          rust-version: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+      - run: rustup component add rust-src --toolchain ${{ matrix.rust }}-${{ matrix.target }}
+      - run: LSAN_OPTIONS="suppressions=$(pwd)/lsan" RUSTFLAGS="-Z sanitizer=leak" cargo test -Z build-std --target=${{ matrix.target }}
+
+  test-miri:
+    name: Test with Miri on ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    env:
+      MIRIFLAGS: -Zmiri-ignore-leaks
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          # 64-bit Linux (kernel 2.6.32+, glibc 2.11+)
+          - x86_64-unknown-linux-gnu
+        rust: [nightly]
+    steps:
+      - uses: actions/checkout@v2
+      - uses: hecrj/setup-rust-action@v1
+        with:
+          rust-version: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+      - run: rustup component add miri
+      - run: cargo miri test -Z build-std --target=${{ matrix.target }}
+
+  test-loom:
+    name: Test with Loom on ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    env:
+      LOOM_MAX_PREEMPTIONS: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          # 64-bit Linux (kernel 2.6.32+, glibc 2.11+)
+          - x86_64-unknown-linux-gnu
+        rust: [nightly]
+    steps:
+      - uses: actions/checkout@v2
+      - uses: hecrj/setup-rust-action@v1
+        with:
+          rust-version: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
       - run: RUSTFLAGS="--cfg loom" cargo test --target=${{ matrix.target }}

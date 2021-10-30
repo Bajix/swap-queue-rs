@@ -25,8 +25,7 @@ tasks:
       - task: test-doc
       - task: test-miri
       - task: test-loom
-      - task: test-address-sanitizer
-      - task: test-thread-sanitizer
+      - task: test-sanitizer
 
   test-doc:
     cmds:
@@ -49,7 +48,6 @@ tasks:
       - src/**/*.rs
     env:
       RUSTFLAGS: --cfg loom
-      ASAN_OPTONS: detect_stack_use_after_return=1
       LOOM_MAX_PREEMPTIONS: 10
 
   test-sanitizer:
@@ -65,7 +63,7 @@ tasks:
       - src/**/*.rs
     ev:
       RUSTFLAGS: -Z sanitizer=address
-      ASAN_OPTONS: detect_stack_use_after_return=1
+      ASAN_OPTIONS: suppressions=asan
 
   test-thread-sanitizer:
     cmds:
@@ -74,6 +72,7 @@ tasks:
       - src/**/*.rs
     env:
       RUSTFLAGS: -Z sanitizer=thread
+      TSAN_OPTIONS: suppressions=tsan
 
   test-leak-sanitizer:
     cmds:
@@ -82,3 +81,4 @@ tasks:
       - src/**/*.rs
     env:
       RUSTFLAGS: -Z sanitizer=leak
+      LSAN_OPTIONS: suppressions=lsan
