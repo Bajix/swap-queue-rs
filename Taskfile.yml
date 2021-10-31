@@ -11,6 +11,15 @@ tasks:
     cmds:
       - task: test-loom
 
+  bench:
+    cmds:
+      - cargo bench --profile release
+
+  update-benchmarks:
+    cmds:
+      - task: bench
+      - git add target/criterion --force
+
   test:
     cmds:
       - task: test-doc

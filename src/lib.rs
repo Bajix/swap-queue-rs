@@ -1,5 +1,5 @@
 //!
-//! A lock-free thread-owned queue whereby tasks are taken by stealers in entirety via buffer swapping. This is meant to be used [`thread_local`] paired with [`tokio::task::spawn`] as a performant take-all batching mechanism.
+//! A lock-free thread-owned queue whereby tasks are taken by stealers in entirety via buffer swapping. This is meant to be used [`thread_local`] paired with [`tokio::task::spawn`] as a highly-performant take-all batching mechanism.
 //!
 
 use crossbeam::{
