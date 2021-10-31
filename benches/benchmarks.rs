@@ -6,56 +6,59 @@ use tokio::runtime::Builder;
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 mod bench_swap_queue {
-  use futures::future::try_join_all;
+  use futures::future::join_all;
   use swap_queue::Worker;
   use tokio::{
     runtime::Handle,
-    sync::oneshot::{channel, error::RecvError, Receiver, Sender},
+    sync::oneshot::{channel, Sender},
   };
 
   thread_local! {
     static QUEUE: Worker<(u64, Sender<u64>)> = Worker::new();
   }
 
-  fn push_echo(i: u64) -> Receiver<u64> {
-    let (tx, rx) = channel();
+  async fn push_echo(i: u64) -> u64 {
+    {
+      let (tx, rx) = channel();
 
-    QUEUE.with(|queue| {
-      if let Some(stealer) = queue.push((i, tx)) {
-        Handle::current().spawn(async move {
-          let batch = stealer.take().await;
+      QUEUE.with(|queue| {
+        if let Some(stealer) = queue.push((i, tx)) {
+          Handle::current().spawn(async move {
+            let batch = stealer.take().await;
 
-          batch.into_iter().for_each(|(i, tx)| {
-            tx.send(i).ok();
+            batch.into_iter().for_each(|(i, tx)| {
+              tx.send(i).ok();
+            });
           });
-        });
-      }
-    });
+        }
+      });
 
-    rx
+      rx
+    }
+    .await
+    .unwrap()
   }
 
   pub async fn bench_batching(batch_size: &u64) {
-    let batch: Result<Vec<u64>, RecvError> =
-      try_join_all((0..*batch_size).map(|i| push_echo(i))).await;
+    let batch: Vec<u64> = join_all((0..*batch_size).map(|i| push_echo(i))).await;
 
-    assert_eq!(batch, Ok((0..*batch_size).collect()))
+    assert_eq!(batch, (0..*batch_size).collect::<Vec<u64>>())
   }
 }
 
 mod bench_crossbeam {
   use crossbeam::deque::{Steal, Worker};
-  use futures::future::try_join_all;
+  use futures::future::join_all;
   use tokio::{
     runtime::Handle,
-    sync::oneshot::{channel, error::RecvError, Receiver, Sender},
+    sync::oneshot::{channel, Sender},
   };
 
   thread_local! {
     static QUEUE: Worker<(u64, Sender<u64>)> = Worker::new_fifo();
   }
 
-  fn push_echo(i: u64) -> Receiver<u64> {
+  async fn push_echo(i: u64) -> u64 {
     let (tx, rx) = channel();
 
     QUEUE.with(|queue| {
@@ -82,19 +85,18 @@ mod bench_crossbeam {
       queue.push((i, tx));
     });
 
-    rx
+    rx.await.unwrap()
   }
 
   pub async fn bench_batching(batch_size: &u64) {
-    let batch: Result<Vec<u64>, RecvError> =
-      try_join_all((0..*batch_size).map(|i| push_echo(i))).await;
+    let batch: Vec<u64> = join_all((0..*batch_size).map(|i| push_echo(i))).await;
 
-    assert_eq!(batch, Ok((0..*batch_size).collect()))
+    assert_eq!(batch, (0..*batch_size).collect::<Vec<u64>>())
   }
 }
 
 mod bench_tokio {
-  use futures::future::try_join_all;
+  use futures::future::join_all;
   use tokio::{
     runtime::Handle,
     sync::{mpsc, oneshot},
@@ -120,7 +122,7 @@ mod bench_tokio {
     tx
   }
 
-  fn push_echo(i: u64) -> oneshot::Receiver<u64> {
+  async fn push_echo(i: u64) -> u64 {
     thread_local! {
       static QUEUE: mpsc::UnboundedSender<(u64, oneshot::Sender<u64>)> = make_reactor();
     }
@@ -131,20 +133,19 @@ mod bench_tokio {
       queue_tx.send((i, tx)).ok();
     });
 
-    rx
+    rx.await.unwrap()
   }
 
   pub async fn bench_batching(batch_size: &u64) {
-    let batch: Result<Vec<u64>, oneshot::error::RecvError> =
-      try_join_all((0..*batch_size).map(|i| push_echo(i))).await;
+    let batch: Vec<u64> = join_all((0..*batch_size).map(|i| push_echo(i))).await;
 
-    assert_eq!(batch, Ok((0..*batch_size).collect()))
+    assert_eq!(batch, (0..*batch_size).collect::<Vec<u64>>())
   }
 }
 
 mod bench_flume {
   use flume::{self, Sender};
-  use futures::future::try_join_all;
+  use futures::future::join_all;
   use tokio::{runtime::Handle, sync::oneshot};
 
   fn make_reactor() -> Sender<(u64, oneshot::Sender<u64>)> {
@@ -167,7 +168,7 @@ mod bench_flume {
     tx
   }
 
-  fn push_echo(i: u64) -> oneshot::Receiver<u64> {
+  async fn push_echo(i: u64) -> u64 {
     thread_local! {
       static QUEUE: Sender<(u64, oneshot::Sender<u64>)> = make_reactor();
     }
@@ -178,14 +179,13 @@ mod bench_flume {
       queue_tx.send((i, tx)).ok();
     });
 
-    rx
+    rx.await.unwrap()
   }
 
   pub async fn bench_batching(batch_size: &u64) {
-    let batch: Result<Vec<u64>, oneshot::error::RecvError> =
-      try_join_all((0..*batch_size).map(|i| push_echo(i))).await;
+    let batch: Vec<u64> = join_all((0..*batch_size).map(|i| push_echo(i))).await;
 
-    assert_eq!(batch, Ok((0..*batch_size).collect()))
+    assert_eq!(batch, (0..*batch_size).collect::<Vec<u64>>())
   }
 }
 
