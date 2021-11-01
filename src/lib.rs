@@ -1,6 +1,51 @@
 //!
-//! A lock-free thread-owned queue whereby tasks are taken by stealers in entirety via buffer swapping. This is meant to be used [`thread_local`] paired with [`tokio::task::spawn`] as a highly-performant take-all batching mechanism.
+//! A lock-free thread-owned queue whereby tasks are taken by stealers in entirety via buffer swapping. This is meant to be used [`thread_local`] paired with [`tokio::task::spawn`] as a take-all batching mechanism that outperforms [`crossbeam::deque::Worker`], and [`tokio::sync::mpsc`] for batching.
 //!
+//! ## Example
+//!
+//! ```
+//! use swap_queue::Worker;
+//! use tokio::{
+//!   runtime::Handle,
+//!   sync::oneshot::{channel, Sender},
+//! };
+//!
+//! // Jemalloc makes this library substantially faster
+//! #[global_allocator]
+//! static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+//!
+//! // Worker needs to be thread local because it is !Sync
+//! thread_local! {
+//!   static QUEUE: Worker<(u64, Sender<u64>)> = Worker::new();
+//! }
+//!
+//! // This mechanism will batch optimally without overhead within an async-context because take will poll after everything else scheduled
+//! async fn push_echo(i: u64) -> u64 {
+//!   {
+//!     let (tx, rx) = channel();
+//!
+//!     QUEUE.with(|queue| {
+//!       // A new stealer is issued for every buffer swap
+//!       if let Some(stealer) = queue.push((i, tx)) {
+//!         Handle::current().spawn(async move {
+//!           // Take the underlying buffer in entirety.
+//!           let batch = stealer.take().await;
+//!
+//!           // Some sort of batched operation, such as a database load
+//!
+//!           batch.into_iter().for_each(|(i, tx)| {
+//!             tx.send(i).ok();
+//!           });
+//!         });
+//!       }
+//!     });
+//!
+//!     rx
+//!   }
+//!   .await
+//!   .unwrap()
+//! }
+//! ```
 
 use crossbeam::{
   epoch::{self, Atomic, Owned, Shared},
@@ -149,9 +194,7 @@ impl<T> Drop for Inner<T> {
   }
 }
 
-/// A worker queue.
-///
-/// This is a queue that is owned by a single thread, but other threads may steal the entire underlying buffer. Typically one would use a single worker queue per thread.
+/// A thread-owned worker queue that writes to a swappable buffer using atomic slotting
 ///
 /// # Examples
 ///
@@ -318,6 +361,8 @@ impl<T> fmt::Debug for Worker<T> {
     f.pad("Worker { .. }")
   }
 }
+
+/// For every buffer swapped in a stealer is issued that can later swap out and take ownership of that buffer
 pub struct Stealer<T> {
   /// Buffer receiver to be used when waiting on writes
   rx: Receiver<Vec<T>>,
@@ -353,7 +398,7 @@ impl<T> Stealer<T> {
     }
   }
 
-  /// Take the entire queue via swapping the underlying buffer and converting into a `Vec<T>`, blocking only if write in progress
+  /// Take the entire queue via swapping the underlying buffer and converting into a `Vec<T>`, blocking only if write in progress. This is always non-blocking if never moved to a new thread.
   pub fn take_blocking(self) -> Vec<T> {
     let Stealer { rx, inner } = self;
 
