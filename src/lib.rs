@@ -210,7 +210,8 @@ impl<T> Drop for Inner<T> {
 /// let s = w.push(4).unwrap();
 /// w.push(5);
 /// w.push(6);
-/// assert_eq!(s.take_blocking(), vec![4, 5, 6]);
+/// let batch: Vec<_> = s.into();
+/// assert_eq!(batch, vec![4, 5, 6]);
 /// ```
 
 pub struct Worker<T> {
@@ -421,6 +422,12 @@ impl<T> Stealer<T> {
         buffer.to_vec(slot_delta(slot, buffer.slot))
       }
     }
+  }
+}
+
+impl<T> From<Stealer<T>> for Vec<T> {
+  fn from(stealer: Stealer<T>) -> Self {
+    stealer.take_blocking()
   }
 }
 
