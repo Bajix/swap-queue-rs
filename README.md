@@ -25,19 +25,19 @@ thread_local! {
   static QUEUE: Worker<(u64, Sender<u64>)> = Worker::new();
 }
 
-// This mechanism will batch optimally without overhead within an async-context because take will poll after everything else scheduled
+// This mechanism will batch optimally without overhead within an async-context because spawn will happen after things already scheduled
 async fn push_echo(i: u64) -> u64 {
   {
     let (tx, rx) = channel();
 
     QUEUE.with(|queue| {
-      // A new stealer is issued for every buffer swap
+      // A new stealer is returned whenever the buffer is new or was empty
       if let Some(stealer) = queue.push((i, tx)) {
         Handle::current().spawn(async move {
-          // Take the underlying buffer in entirety.
+          // Take the underlying buffer in entirety; the next push will return a new Stealer
           let batch = stealer.take().await;
 
-          // Some sort of batched operation, such as a database load
+          // Some sort of batched operation, such as a database query
 
           batch.into_iter().for_each(|(i, tx)| {
             tx.send(i).ok();

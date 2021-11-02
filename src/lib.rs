@@ -19,19 +19,19 @@
 //!   static QUEUE: Worker<(u64, Sender<u64>)> = Worker::new();
 //! }
 //!
-//! // This mechanism will batch optimally without overhead within an async-context because take will poll after everything else scheduled
+//! // This mechanism will batch optimally without overhead within an async-context because spawn will happen after things already scheduled
 //! async fn push_echo(i: u64) -> u64 {
 //!   {
 //!     let (tx, rx) = channel();
 //!
 //!     QUEUE.with(|queue| {
-//!       // A new stealer is issued for every buffer swap
+//!       // A new stealer is returned whenever the buffer is new or was empty
 //!       if let Some(stealer) = queue.push((i, tx)) {
 //!         Handle::current().spawn(async move {
-//!           // Take the underlying buffer in entirety.
+//!           // Take the underlying buffer in entirety; the next push will return a new Stealer
 //!           let batch = stealer.take().await;
 //!
-//!           // Some sort of batched operation, such as a database load
+//!           // Some sort of batched operation, such as a database query
 //!
 //!           batch.into_iter().for_each(|(i, tx)| {
 //!             tx.send(i).ok();
@@ -205,11 +205,13 @@ impl<T> Drop for Inner<T> {
 /// let s = w.push(1).unwrap();
 /// w.push(2);
 /// w.push(3);
+/// // this is non-blocking because it's called on the same thread as Worker; a write in progress is not possible
 /// assert_eq!(s.take_blocking(), vec![1, 2, 3]);
 ///
 /// let s = w.push(4).unwrap();
 /// w.push(5);
 /// w.push(6);
+/// // this is identical to [`Stealer::take_blocking`]
 /// let batch: Vec<_> = s.into();
 /// assert_eq!(batch, vec![4, 5, 6]);
 /// ```
@@ -229,8 +231,6 @@ unsafe impl<T: Send> Send for Worker<T> {}
 
 impl<T> Worker<T> {
   /// Creates a new Worker queue.
-  ///
-  /// Tasks are pushed and the underlying buffer is swapped and converted back into a `Vec<T>` when taken by a stealer.
   ///
   /// # Examples
   ///
@@ -279,7 +279,7 @@ impl<T> Worker<T> {
     old.dealloc();
   }
 
-  /// Push a task to the queue and returns a Stealer if empty
+  /// Write to the next slot, swapping in a new buffer if necessary and returning a Stealer if the buffer was empty
   pub fn push(&self, task: T) -> Option<Stealer<T>> {
     let slot = self
       .inner
@@ -363,7 +363,7 @@ impl<T> fmt::Debug for Worker<T> {
   }
 }
 
-/// For every buffer swapped in a stealer is issued that can later swap out and take ownership of that buffer
+/// Stealers swap out and take ownership of buffers in entirety from Workers
 pub struct Stealer<T> {
   /// Buffer receiver to be used when waiting on writes
   rx: Receiver<Vec<T>>,
@@ -375,7 +375,7 @@ unsafe impl<T: Send> Send for Stealer<T> {}
 unsafe impl<T: Send> Sync for Stealer<T> {}
 
 impl<T> Stealer<T> {
-  /// Take the entire queue via swapping the underlying buffer and converting into a `Vec<T>`
+  /// Take the entire queue by swapping the underlying buffer and converting back into a `Vec<T>` or by waiting to receive the buffer from the Worker if a write was in progress.
   pub async fn take(self) -> Vec<T> {
     let Stealer { rx, inner } = self;
 
@@ -399,7 +399,7 @@ impl<T> Stealer<T> {
     }
   }
 
-  /// Take the entire queue via swapping the underlying buffer and converting into a `Vec<T>`, blocking only if write in progress. This is always non-blocking if never moved to a new thread.
+  /// Take the entire queue by swapping the underlying buffer and converting into a `Vec<T>` or by blocking to receive from the Worker if a write was in progress. This is always non-blocking when called on the same thread as the Worker
   pub fn take_blocking(self) -> Vec<T> {
     let Stealer { rx, inner } = self;
 
@@ -425,6 +425,7 @@ impl<T> Stealer<T> {
   }
 }
 
+/// Uses [`Stealer::take_blocking`]; non-blocking when called on the same thread as Worker
 impl<T> From<Stealer<T>> for Vec<T> {
   fn from(stealer: Stealer<T>) -> Self {
     stealer.take_blocking()
