@@ -48,7 +48,7 @@
 //! ```
 
 use crossbeam::{
-  epoch::{self, Atomic, Owned, Shared},
+  epoch::{self, Atomic, Owned},
   utils::CachePadded,
 };
 use futures::executor::block_on;
@@ -162,34 +162,6 @@ impl<T> Inner<T> {
       &self.buffers.0
     } else {
       &self.buffers.1
-    }
-  }
-}
-
-impl<T> Drop for Inner<T> {
-  fn drop(&mut self) {
-    let slot = self.slot.load(Ordering::Acquire);
-
-    let guard = &epoch::pin();
-    let buffer = self
-      .get_buffer(slot)
-      .swap(Shared::null(), Ordering::Acquire, guard);
-
-    if !buffer.is_null() {
-      unsafe {
-        guard.defer_unchecked(move || {
-          let buffer = *buffer.into_owned();
-          let length = slot_delta(slot, buffer.slot);
-
-          // Go through the buffer from front to back and drop all tasks in the queue.
-          for i in 0..length {
-            buffer.at(i).drop_in_place();
-          }
-
-          // Free the memory allocated by the buffer.
-          buffer.dealloc();
-        });
-      }
     }
   }
 }
@@ -363,6 +335,41 @@ impl<T> fmt::Debug for Worker<T> {
   }
 }
 
+impl<T> Drop for Worker<T> {
+  fn drop(&mut self) {
+    // By leaving this as indefinitely write in progress the Stealer will always receive from the oneshot::Sender
+    let slot = self
+      .inner
+      .slot
+      .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
+
+    let buffer = self.buffer.get();
+
+    // Is buffer still current? (If not Stealer has already taken buffer)
+    if slot & BUFFER_IDX == buffer.slot & BUFFER_IDX {
+      let length = slot_delta(slot, buffer.slot);
+
+      // Send to Stealer if able
+      if let Some(tx) = self.tx.replace(None) {
+        if let Err(queue) = tx.send(unsafe { buffer.to_vec(length) }) {
+          drop(queue);
+        }
+      } else {
+        // Otherwise deallocate everything
+        unsafe {
+          // Go through the buffer from front to back and drop all tasks in the queue.
+          for i in 0..length {
+            buffer.at(i).drop_in_place();
+          }
+
+          // Free the memory allocated by the buffer.
+          buffer.dealloc();
+        }
+      }
+    }
+  }
+}
+
 /// Stealers swap out and take ownership of buffers in entirety from Workers
 pub struct Stealer<T> {
   /// Buffer receiver to be used when waiting on writes
@@ -388,9 +395,7 @@ impl<T> Stealer<T> {
     } else {
       let guard = &epoch::pin();
 
-      let buffer = inner
-        .get_buffer(slot)
-        .swap(Shared::null(), Ordering::Acquire, guard);
+      let buffer = inner.get_buffer(slot).load_consume(guard);
 
       unsafe {
         let buffer = *buffer.into_owned();
@@ -413,9 +418,7 @@ impl<T> Stealer<T> {
     } else {
       let guard = &epoch::pin();
 
-      let buffer = inner
-        .get_buffer(slot)
-        .swap(Shared::null(), Ordering::Acquire, guard);
+      let buffer = inner.get_buffer(slot).load_consume(guard);
 
       unsafe {
         let buffer = *buffer.into_owned();
