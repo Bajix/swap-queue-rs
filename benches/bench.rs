@@ -1,5 +1,6 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::time::Duration;
+
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use tokio::runtime::Builder;
 
 #[global_allocator]
@@ -47,7 +48,7 @@ mod bench_swap_queue {
 }
 
 mod bench_crossbeam {
-  use crossbeam::deque::{Steal, Worker};
+  use crossbeam_deque::{Steal, Worker};
   use futures::future::join_all;
   use tokio::{
     runtime::Handle,
@@ -62,7 +63,7 @@ mod bench_crossbeam {
     let (tx, rx) = channel();
 
     QUEUE.with(|queue| {
-      // crossbeam::deque::Worker could be patched to return slot written, so we're going to give this the benefit of that potential optimization
+      // crossbeam_deque::Worker could be patched to return slot written, so we're going to give this the benefit of that potential optimization
       if i.eq(&0) {
         let stealer = queue.stealer();
 
@@ -192,14 +193,188 @@ mod bench_flume {
 fn criterion_benchmark(c: &mut Criterion) {
   let rt = Builder::new_current_thread().build().unwrap();
 
-  let mut group = c.benchmark_group("Batching");
+  let mut push_tests = c.benchmark_group("Push");
+  push_tests.warm_up_time(Duration::from_millis(10));
+  push_tests.measurement_time(Duration::from_secs(1));
+  push_tests.sample_size(50);
 
-  group.warm_up_time(Duration::from_millis(100));
-  group.sample_size(500);
-
-  for n in 6..=10 {
+  for n in 0..=12 {
     let batch_size: u64 = 1 << n;
-    group.bench_with_input(
+    push_tests.bench_with_input(
+      BenchmarkId::new("swap_queue", batch_size),
+      &batch_size,
+      |b, batch_size| {
+        b.iter_batched(
+          || swap_queue::Worker::new(),
+          |queue| {
+            for i in 0..*batch_size {
+              queue.push(i);
+            }
+          },
+          BatchSize::SmallInput,
+        )
+      },
+    );
+
+    push_tests.bench_with_input(
+      BenchmarkId::new("crossbeam", batch_size),
+      &batch_size,
+      |b, batch_size| {
+        b.iter_batched(
+          || crossbeam_deque::Worker::new_fifo(),
+          |queue| {
+            for i in 0..*batch_size {
+              queue.push(i);
+            }
+          },
+          BatchSize::SmallInput,
+        )
+      },
+    );
+
+    push_tests.bench_with_input(
+      BenchmarkId::new("flume", batch_size),
+      &batch_size,
+      |b, batch_size| {
+        b.iter_batched(
+          || flume::unbounded(),
+          |(tx, _rx)| {
+            for i in 0..*batch_size {
+              tx.send(i).ok();
+            }
+          },
+          BatchSize::SmallInput,
+        )
+      },
+    );
+
+    push_tests.bench_with_input(
+      BenchmarkId::new("tokio::mpsc", batch_size),
+      &batch_size,
+      |b, batch_size| {
+        b.iter_batched(
+          || tokio::sync::mpsc::unbounded_channel(),
+          |(tx, _rx)| {
+            for i in 0..*batch_size {
+              tx.send(i).ok();
+            }
+          },
+          BatchSize::SmallInput,
+        )
+      },
+    );
+  }
+
+  push_tests.finish();
+
+  let mut take_tests = c.benchmark_group("Take");
+  take_tests.warm_up_time(Duration::from_millis(10));
+  take_tests.measurement_time(Duration::from_secs(1));
+  take_tests.sample_size(50);
+
+  for n in 0..=12 {
+    let batch_size: u64 = 1 << n;
+    take_tests.bench_with_input(
+      BenchmarkId::new("swap_queue", batch_size),
+      &batch_size,
+      |b, batch_size| {
+        b.iter_batched(
+          || {
+            let worker = swap_queue::Worker::new();
+            let stealer = worker.push(0).unwrap();
+            for i in 1..*batch_size {
+              worker.push(i);
+            }
+
+            stealer
+          },
+          |stealer| stealer.take_blocking(),
+          BatchSize::SmallInput,
+        );
+      },
+    );
+
+    take_tests.bench_with_input(
+      BenchmarkId::new("crossbeam", batch_size),
+      &batch_size,
+      |b, batch_size| {
+        b.iter_batched(
+          || {
+            let worker = crossbeam_deque::Worker::new_fifo();
+            let stealer = worker.stealer();
+            for i in 1..*batch_size {
+              worker.push(i);
+            }
+
+            stealer
+          },
+          |stealer| {
+            let _: Vec<u64> = std::iter::from_fn(|| loop {
+              match stealer.steal() {
+                crossbeam_deque::Steal::Success(task) => break Some(task),
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Empty => break None,
+              }
+            })
+            .collect();
+          },
+          BatchSize::SmallInput,
+        );
+      },
+    );
+
+    take_tests.bench_with_input(
+      BenchmarkId::new("flume", batch_size),
+      &batch_size,
+      |b, batch_size| {
+        b.iter_batched(
+          || {
+            let (tx, rx) = flume::unbounded();
+            for i in 1..*batch_size {
+              tx.send(i).ok();
+            }
+            rx
+          },
+          |rx| {
+            let _: Vec<u64> = rx.try_iter().collect();
+          },
+          BatchSize::SmallInput,
+        );
+      },
+    );
+
+    take_tests.bench_with_input(
+      BenchmarkId::new("tokio::mpsc", batch_size),
+      &batch_size,
+      |b, batch_size| {
+        b.iter_batched(
+          || {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            for i in 1..*batch_size {
+              tx.send(i).ok();
+            }
+            rx
+          },
+          |mut rx| {
+            let _: Vec<u64> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+          },
+          BatchSize::SmallInput,
+        );
+      },
+    );
+  }
+
+  take_tests.finish();
+
+  let mut async_batching_tests = c.benchmark_group("Batching");
+  async_batching_tests.warm_up_time(Duration::from_millis(10));
+  async_batching_tests.measurement_time(Duration::from_secs(1));
+  async_batching_tests.sample_size(50);
+
+  for n in 0..=12 {
+    let batch_size: u64 = 1 << n;
+
+    async_batching_tests.bench_with_input(
       BenchmarkId::new("swap_queue", batch_size),
       &batch_size,
       |b, batch_size| {
@@ -208,7 +383,7 @@ fn criterion_benchmark(c: &mut Criterion) {
       },
     );
 
-    group.bench_with_input(
+    async_batching_tests.bench_with_input(
       BenchmarkId::new("crossbeam", batch_size),
       &batch_size,
       |b, batch_size| {
@@ -217,7 +392,7 @@ fn criterion_benchmark(c: &mut Criterion) {
       },
     );
 
-    group.bench_with_input(
+    async_batching_tests.bench_with_input(
       BenchmarkId::new("flume", batch_size),
       &batch_size,
       |b, batch_size| {
@@ -226,7 +401,7 @@ fn criterion_benchmark(c: &mut Criterion) {
       },
     );
 
-    group.bench_with_input(
+    async_batching_tests.bench_with_input(
       BenchmarkId::new("tokio::mpsc", batch_size),
       &batch_size,
       |b, batch_size| {
@@ -236,7 +411,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     );
   }
 
-  group.finish();
+  async_batching_tests.finish();
 }
 
 criterion_group!(benches, criterion_benchmark);
