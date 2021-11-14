@@ -48,7 +48,7 @@ mod bench_swap_queue {
 }
 
 mod bench_crossbeam {
-  use crossbeam::deque::{Steal, Worker};
+  use crossbeam_deque::{Steal, Worker};
   use futures::future::join_all;
   use tokio::{
     runtime::Handle,
@@ -63,7 +63,7 @@ mod bench_crossbeam {
     let (tx, rx) = channel();
 
     QUEUE.with(|queue| {
-      // crossbeam::deque::Worker could be patched to return slot written, so we're going to give this the benefit of that potential optimization
+      // crossbeam_deque::Worker could be patched to return slot written, so we're going to give this the benefit of that potential optimization
       if i.eq(&0) {
         let stealer = queue.stealer();
 
@@ -221,7 +221,7 @@ fn criterion_benchmark(c: &mut Criterion) {
       &batch_size,
       |b, batch_size| {
         b.iter_batched(
-          || crossbeam::deque::Worker::new_fifo(),
+          || crossbeam_deque::Worker::new_fifo(),
           |queue| {
             for i in 0..*batch_size {
               queue.push(i);
@@ -300,7 +300,7 @@ fn criterion_benchmark(c: &mut Criterion) {
       |b, batch_size| {
         b.iter_batched(
           || {
-            let worker = crossbeam::deque::Worker::new_fifo();
+            let worker = crossbeam_deque::Worker::new_fifo();
             let stealer = worker.stealer();
             for i in 1..*batch_size {
               worker.push(i);
@@ -311,9 +311,9 @@ fn criterion_benchmark(c: &mut Criterion) {
           |stealer| {
             let _: Vec<u64> = std::iter::from_fn(|| loop {
               match stealer.steal() {
-                crossbeam::deque::Steal::Success(task) => break Some(task),
-                crossbeam::deque::Steal::Retry => continue,
-                crossbeam::deque::Steal::Empty => break None,
+                crossbeam_deque::Steal::Success(task) => break Some(task),
+                crossbeam_deque::Steal::Retry => continue,
+                crossbeam_deque::Steal::Empty => break None,
               }
             })
             .collect();
