@@ -12,6 +12,8 @@ tasks:
       - task: test-loom
 
   bench:
+    env:
+      RUSTFLAGS: "-C target-cpu=native"
     cmds:
       - cargo bench --profile release
 

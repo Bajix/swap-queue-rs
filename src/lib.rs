@@ -47,10 +47,9 @@
 //! }
 //! ```
 
-use crossbeam::{
-  epoch::{self, Atomic, Owned, Shared},
-  utils::CachePadded,
-};
+use crossbeam_epoch::{self as epoch, Atomic, Owned, Shared};
+use crossbeam_utils::CachePadded;
+
 use futures::executor::block_on;
 use std::{cell::Cell, fmt, marker::PhantomData, mem, ptr, sync::Arc};
 use tokio::sync::oneshot::{channel, Receiver, Sender};

@@ -11,7 +11,8 @@ repository = "https://github.com/Bajix/swap-queue-rs/"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-crossbeam = "0.8.1"
+crossbeam-epoch = "0.9.5"
+crossbeam-utils = "0.8.5"
 futures = "0.3.17"
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 
@@ -20,16 +21,23 @@ loom = "0.5.2"
 
 [lib]
 doctest = false
+bench = false
 
 [dev-dependencies]
-criterion = { version = "0.3.5", features = ["async_tokio"] }
+criterion = { version = "0.3.5", features = ["async_tokio", "html_reports"] }
+crossbeam-deque = "0.8.1"
 flume = "0.10.9"
 jemallocator = "0.3.2"
 
 [[bench]]
 name = "benchmarks"
-path = "benches/benchmarks.rs"
+path = "benches/bench.rs"
 harness = false
+doc = false
+
+[profile.bench]
+lto = "fat"
+codegen-units = 1
 
 [profile.release]
 lto = "fat"
