@@ -57,10 +57,10 @@ async fn push_echo(i: u64) -> u64 {
 
 Benchmarks ran on t4g.medium running Amazon Linux 2 AMI (HVM)
 
-<img src="target/criterion/Batching/64/report/violin.svg" alt="Benchmarks, 64 tasks" width="100%"/>
-<img src="target/criterion/Batching/128/report/violin.svg" alt="Benchmarks, 128 tasks" width="100%"/>
-<img src="target/criterion/Batching/256/report/violin.svg" alt="Benchmarks, 256 tasks" width="100%"/>
-<img src="target/criterion/Batching/512/report/violin.svg" alt="Benchmarks, 512 tasks" width="100%"/>
-<img src="target/criterion/Batching/1024/report/violin.svg" alt="Benchmarks, 1024 tasks" width="100%"/>
+<img src="https://raw.githubusercontent.com/Bajix/swap-queue-benchmarks/master/Batching/64/report/violin.svg" alt="Benchmarks, 64 tasks" width="100%"/>
+<img src="https://raw.githubusercontent.com/Bajix/swap-queue-benchmarks/master/Batching/128/report/violin.svg" alt="Benchmarks, 128 tasks" width="100%"/>
+<img src="https://raw.githubusercontent.com/Bajix/swap-queue-benchmarks/master/Batching/256/report/violin.svg" alt="Benchmarks, 256 tasks" width="100%"/>
+<img src="https://raw.githubusercontent.com/Bajix/swap-queue-benchmarks/master/Batching/512/report/violin.svg" alt="Benchmarks, 512 tasks" width="100%"/>
+<img src="https://raw.githubusercontent.com/Bajix/swap-queue-benchmarks/master/Batching/1024/report/violin.svg" alt="Benchmarks, 1024 tasks" width="100%"/>
 
 CI tested under ThreadSanitizer, LeakSanitizer, Miri and Loom.

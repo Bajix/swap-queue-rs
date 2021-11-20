@@ -1,0 +1,4 @@
+[submodule "benchmarks"]
+	path = target/criterion
+	url = git@github.com:Bajix/swap-queue-benchmarks.git
+	branch = master
