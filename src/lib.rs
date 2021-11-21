@@ -1,5 +1,5 @@
 //!
-//! A lock-free thread-owned queue whereby tasks are taken by stealers in entirety via buffer swapping. This is meant to be used [`thread_local`] paired with [`tokio::task::spawn`] as a take-all batching mechanism that outperforms [`crossbeam::deque::Worker`], and [`tokio::sync::mpsc`] for batching.
+//! A lock-free thread-owned queue whereby tasks are taken by stealers in entirety via buffer swapping. This is meant to be used [`thread_local`] paired with [`tokio::task::spawn`] as a constant-time take-all batching mechanism that outperforms [`crossbeam_deque::Worker`](https://docs.rs/crossbeam-deque/0.8.1/crossbeam_deque/struct.Worker.html), and [`tokio::sync::mpsc`] for batching.
 //!
 //! ## Example
 //!
