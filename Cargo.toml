@@ -2,11 +2,12 @@
 authors = ["Thomas Sieverding <Thomas@bajix.com>"]
 edition = "2021"
 name = "swap-queue"
-version = "1.0.0"
+version = "1.1.0"
 description = "A lock-free thread-owned queue whereby tasks are taken by stealers in entirety via buffer swapping"
 readme = "./README.md"
 license = "MIT"
 repository = "https://github.com/Bajix/swap-queue-rs/"
+exclude = ["/target/criterion/*"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
