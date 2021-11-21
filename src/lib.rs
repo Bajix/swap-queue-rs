@@ -29,7 +29,7 @@
 //!       if let Some(stealer) = queue.push((i, tx)) {
 //!         Handle::current().spawn(async move {
 //!           // Take the underlying buffer in entirety; the next push will return a new Stealer
-//!           let batch = stealer.take().await;
+//!           let batch = stealer.to_vec();
 //!
 //!           // Some sort of batched operation, such as a database query
 //!
@@ -49,10 +49,8 @@
 
 use crossbeam_epoch::{self as epoch, Atomic, Owned};
 use crossbeam_utils::CachePadded;
-
-use futures::executor::block_on;
+use parking_lot::{Condvar, Mutex};
 use std::{cell::Cell, fmt, marker::PhantomData, mem, ptr, sync::Arc};
-use tokio::sync::oneshot::{channel, Receiver, Sender};
 
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicUsize, Ordering};
@@ -149,6 +147,8 @@ fn slot_delta(a: usize, b: usize) -> usize {
 
 struct Inner<T> {
   slot: AtomicUsize,
+  switch: CachePadded<Mutex<bool>>,
+  cvar: CachePadded<Condvar>,
   buffers: (
     CachePadded<Atomic<Buffer<T>>>,
     CachePadded<Atomic<Buffer<T>>>,
@@ -177,12 +177,12 @@ impl<T> Inner<T> {
 /// w.push(2);
 /// w.push(3);
 /// // this is non-blocking because it's called on the same thread as Worker; a write in progress is not possible
-/// assert_eq!(s.take_blocking(), vec![1, 2, 3]);
+/// assert_eq!(s.to_vec(), vec![1, 2, 3]);
 ///
 /// let s = w.push(4).unwrap();
 /// w.push(5);
 /// w.push(6);
-/// // this is identical to [`Stealer::take_blocking`]
+/// // this is identical to [`Stealer::to_vec`]
 /// let batch: Vec<_> = s.into();
 /// assert_eq!(batch, vec![4, 5, 6]);
 /// ```
@@ -198,8 +198,6 @@ pub struct Worker<T> {
   inner: Arc<CachePadded<Inner<T>>>,
   /// A copy of `inner.buffer` for quick access.
   buffer: Cell<Buffer<T>>,
-  /// Send handle corresponding to the current Stealer
-  tx: Cell<Option<Sender<Vec<T>>>>,
   /// Indicates that the worker cannot be shared among threads.
   _marker: PhantomData<*mut ()>,
 }
@@ -217,10 +215,17 @@ impl<T> Worker<T> {
   /// let w = Worker::<i32>::new();
   /// ```
   pub fn new() -> Worker<T> {
-    let buffer = Buffer::alloc(0, MIN_CAP);
+    // Placeholder buffer to force initial buffer swap
+    let buffer = Buffer {
+      slot: BUFFER_IDX,
+      ptr: std::ptr::null_mut(),
+      cap: MIN_CAP,
+    };
 
     let inner = Arc::new(CachePadded::new(Inner {
       slot: AtomicUsize::new(0),
+      switch: CachePadded::new(Mutex::new(false)),
+      cvar: CachePadded::new(Condvar::new()),
       buffers: (
         CachePadded::new(Atomic::new(buffer)),
         CachePadded::new(Atomic::null()),
@@ -231,7 +236,6 @@ impl<T> Worker<T> {
       flavor: Flavor::Unbounded,
       inner,
       buffer: Cell::new(buffer),
-      tx: Cell::new(None),
       _marker: PhantomData,
     }
   }
@@ -253,10 +257,17 @@ impl<T> Worker<T> {
       "batch_size must be a power of 2"
     );
 
-    let buffer = Buffer::alloc(0, MIN_CAP);
+    // Placeholder buffer to force initial buffer swap
+    let buffer = Buffer {
+      slot: BUFFER_IDX,
+      ptr: std::ptr::null_mut(),
+      cap: batch_size,
+    };
 
     let inner = Arc::new(CachePadded::new(Inner {
       slot: AtomicUsize::new(0),
+      switch: CachePadded::new(Mutex::new(false)),
+      cvar: CachePadded::new(Condvar::new()),
       buffers: (
         CachePadded::new(Atomic::new(buffer)),
         CachePadded::new(Atomic::null()),
@@ -267,7 +278,6 @@ impl<T> Worker<T> {
       flavor: Flavor::AutoBatched { batch_size },
       inner,
       buffer: Cell::new(buffer),
-      tx: Cell::new(None),
       _marker: PhantomData,
     }
   }
@@ -336,12 +346,8 @@ impl<T> Worker<T> {
         .slot
         .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
 
-      let (tx, rx) = channel();
-      self.tx.set(Some(tx));
-
       Some(Stealer::Taker(StealHandle {
-        rx,
-        inner: self.inner.clone(),
+        inner: Some(self.inner.clone()),
       }))
     } else {
       let index = slot_delta(slot, buffer.slot);
@@ -358,28 +364,21 @@ impl<T> Worker<T> {
             .slot
             .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
 
-          // Stealer expressed intention to take buffer by changing the buffer index, and is waiting on Worker to send buffer upon completion of the current write in progress
+          // Stealer expressed intention to take buffer by changing the buffer index, and is waiting on Worker to notify upon completion of the current write in progress
           if ((slot ^ buffer.slot) & BUFFER_IDX).eq(&BUFFER_IDX) {
-            let (tx, rx) = channel();
-            let tx = self.tx.replace(Some(tx)).unwrap();
-
-            // Send buffer as vec to receiver
-            tx.send(unsafe { buffer.to_vec(index) }).ok();
+            // Notify stealer that it can now take the buffer
+            self.inner.cvar.notify_one();
 
             Some(Stealer::Taker(StealHandle {
-              rx,
-              inner: self.inner.clone(),
+              inner: Some(self.inner.clone()),
             }))
           } else {
             None
           }
         }
-        Flavor::AutoBatched { batch_size } if index.eq(batch_size) => {
-          let old = self.replace_buffer(&mut buffer, slot, *batch_size);
-          let batch = unsafe { old.to_vec(*batch_size) };
-
+        Flavor::AutoBatched { batch_size } if index.eq(&(batch_size - 1)) => {
           unsafe {
-            buffer.write(0, task);
+            buffer.write(index, task);
           }
 
           let slot = self
@@ -388,36 +387,17 @@ impl<T> Worker<T> {
             .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
 
           if ((slot ^ buffer.slot) & BUFFER_IDX).eq(&BUFFER_IDX) {
-            let (tx, rx) = channel();
-            let tx = self.tx.replace(Some(tx)).unwrap();
-
-            tx.send(batch).ok();
+            // Notify stealer that it can now take the buffer
+            self.inner.cvar.notify_one();
 
             Some(Stealer::Taker(StealHandle {
-              rx,
-              inner: self.inner.clone(),
+              inner: Some(self.inner.clone()),
             }))
           } else {
+            let old = self.replace_buffer(&mut buffer, slot + (1 << FLAGS_SHIFT), *batch_size);
+            let batch = unsafe { old.to_vec(*batch_size) };
             Some(Stealer::Owner(batch))
           }
-        }
-        _ if index.eq(&0) => {
-          unsafe {
-            buffer.write(0, task);
-          }
-
-          self
-            .inner
-            .slot
-            .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
-
-          let (tx, rx) = channel();
-          self.tx.set(Some(tx));
-
-          Some(Stealer::Taker(StealHandle {
-            rx,
-            inner: self.inner.clone(),
-          }))
         }
         _ => {
           unsafe {
@@ -430,15 +410,11 @@ impl<T> Worker<T> {
             .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
 
           if ((slot ^ buffer.slot) & BUFFER_IDX).eq(&BUFFER_IDX) {
-            let (tx, rx) = channel();
-            let tx = self.tx.replace(Some(tx)).unwrap();
-
-            // Send buffer as vec to receiver
-            tx.send(unsafe { buffer.to_vec(index) }).ok();
+            // Notify stealer that it can now take the buffer
+            self.inner.cvar.notify_one();
 
             Some(Stealer::Taker(StealHandle {
-              rx,
-              inner: self.inner.clone(),
+              inner: Some(self.inner.clone()),
             }))
           } else {
             None
@@ -460,48 +436,42 @@ impl<T> fmt::Debug for Worker<T> {
     f.pad("Worker { .. }")
   }
 }
+#[doc(hidden)]
+pub struct StealHandle<T> {
+  /// A reference to the inner representation of the queue.
+  inner: Option<Arc<CachePadded<Inner<T>>>>,
+}
 
-impl<T> Drop for Worker<T> {
+impl<T> Drop for StealHandle<T> {
   fn drop(&mut self) {
-    // By leaving this as indefinitely write in progress the Stealer will always receive from the oneshot::Sender
-    let slot = self
-      .inner
-      .slot
-      .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
+    let inner = std::mem::replace(&mut self.inner, None);
 
-    let buffer = self.buffer.get();
+    if let Some(inner) = inner {
+      let slot = inner.slot.fetch_xor(BUFFER_IDX, Ordering::Relaxed);
 
-    // Is buffer still current? (If not Stealer has already taken buffer)
-    if slot & BUFFER_IDX == buffer.slot & BUFFER_IDX {
-      let length = slot_delta(slot, buffer.slot);
+      if slot & WRITE_IN_PROGRESS == WRITE_IN_PROGRESS {
+        let mut switch = inner.switch.lock();
+        inner.cvar.wait(&mut switch);
+      }
 
-      // Send to Stealer if able
-      if let Some(tx) = self.tx.replace(None) {
-        if let Err(queue) = tx.send(unsafe { buffer.to_vec(length) }) {
-          drop(queue);
+      let guard = &epoch::pin();
+
+      let buffer = inner.get_buffer(slot).load_consume(guard);
+
+      unsafe {
+        let buffer = *buffer.into_owned();
+        let length = slot_delta(slot, buffer.slot);
+
+        // Go through the buffer from front to back and drop all tasks in the queue.
+        for i in 0..length {
+          buffer.at(i).drop_in_place();
         }
-      } else {
-        // Otherwise deallocate everything
-        unsafe {
-          // Go through the buffer from front to back and drop all tasks in the queue.
-          for i in 0..length {
-            buffer.at(i).drop_in_place();
-          }
 
-          // Free the memory allocated by the buffer.
-          buffer.dealloc();
-        }
+        // Free the memory allocated by the buffer.
+        buffer.dealloc();
       }
     }
   }
-}
-
-#[doc(hidden)]
-pub struct StealHandle<T> {
-  /// Buffer receiver to be used when waiting on writes
-  rx: Receiver<Vec<T>>,
-  /// A reference to the inner representation of the queue.
-  inner: Arc<CachePadded<Inner<T>>>,
 }
 
 /// Stealers swap out and take ownership of buffers in entirety from Workers
@@ -516,62 +486,39 @@ unsafe impl<T: Send> Send for Stealer<T> {}
 unsafe impl<T: Send> Sync for Stealer<T> {}
 
 impl<T> Stealer<T> {
-  /// Take the entire queue by swapping the underlying buffer and converting back into a `Vec<T>` or by waiting to receive the buffer from the Worker if a write was in progress.
-  pub async fn take(self) -> Vec<T> {
-    match self {
-      Stealer::Owner(batch) => batch,
-      Stealer::Taker(StealHandle { rx, inner }) => {
-        let slot = inner.slot.fetch_xor(BUFFER_IDX, Ordering::Relaxed);
+  /// Take the entire queue by swapping the underlying buffer and converting back into a `Vec<T>`
+  pub fn to_vec(mut self) -> Vec<T> {
+    if let Stealer::Taker(StealHandle { ref mut inner }) = &mut self {
+      let inner = inner.take().unwrap();
 
-        // Worker will see the buffer has swapped when confirming length increment
-        if slot & WRITE_IN_PROGRESS == WRITE_IN_PROGRESS {
-          // Writer can never be dropped mid-write, therefore RecvError cannot occur
-          rx.await.unwrap()
-        } else {
-          let guard = &epoch::pin();
+      let slot = inner.slot.fetch_xor(BUFFER_IDX, Ordering::Relaxed);
 
-          let buffer = inner.get_buffer(slot).load_consume(guard);
-
-          unsafe {
-            let buffer = *buffer.into_owned();
-            buffer.to_vec(slot_delta(slot, buffer.slot))
-          }
-        }
+      if (slot & WRITE_IN_PROGRESS).eq(&WRITE_IN_PROGRESS) {
+        let mut switch = inner.switch.lock();
+        inner.cvar.wait(&mut switch);
+        drop(switch);
       }
-    }
-  }
 
-  /// Take the entire queue by swapping the underlying buffer and converting into a `Vec<T>` or by blocking to receive from the Worker if a write was in progress. This is always non-blocking when called on the same thread as the Worker
-  pub fn take_blocking(self) -> Vec<T> {
-    match self {
-      Stealer::Owner(batch) => batch,
-      Stealer::Taker(StealHandle { rx, inner }) => {
-        let slot = inner.slot.fetch_xor(BUFFER_IDX, Ordering::Relaxed);
+      let guard = &epoch::pin();
 
-        // Worker will see the buffer has swapped when confirming length increment
-        // It's not possible for this to be write in progress when called from the same thread as the queue
-        if slot & WRITE_IN_PROGRESS == WRITE_IN_PROGRESS {
-          // Writer can never be dropped mid-write, therefore RecvError cannot occur
-          block_on(rx).unwrap()
-        } else {
-          let guard = &epoch::pin();
+      let buffer = inner.get_buffer(slot).load_consume(guard);
 
-          let buffer = inner.get_buffer(slot).load_consume(guard);
-
-          unsafe {
-            let buffer = *buffer.into_owned();
-            buffer.to_vec(slot_delta(slot, buffer.slot))
-          }
-        }
+      unsafe {
+        let buffer = *buffer.into_owned();
+        buffer.to_vec(slot_delta(slot, buffer.slot))
       }
+    } else if let Stealer::Owner(batch) = self {
+      batch
+    } else {
+      unreachable!()
     }
   }
 }
 
-/// Uses [`Stealer::take_blocking`]; non-blocking when called on the same thread as Worker
+/// Uses [`Stealer::to_vec`]; non-blocking when called on the same thread as Worker
 impl<T> From<Stealer<T>> for Vec<T> {
   fn from(stealer: Stealer<T>) -> Self {
-    stealer.take_blocking()
+    stealer.to_vec()
   }
 }
 
@@ -615,10 +562,10 @@ mod tests {
       let stealer = queue.push(0).unwrap();
 
       for i in 1..128 {
-        queue.push(i);
+        assert!(queue.push(i).is_none());
       }
 
-      let batch = stealer.take_blocking();
+      let batch = stealer.to_vec();
       let expected = (0..128).collect::<Vec<i32>>();
 
       assert_eq!(batch, expected);
@@ -631,16 +578,16 @@ mod tests {
       let queue = Worker::new();
       let stealer = queue.push(0).unwrap();
 
-      queue.push(1);
-      queue.push(2);
+      assert!(queue.push(1).is_none());
+      assert!(queue.push(2).is_none());
 
-      assert_eq!(stealer.take_blocking(), vec![0, 1, 2]);
+      assert_eq!(stealer.to_vec(), vec![0, 1, 2]);
 
       let stealer = queue.push(3).unwrap();
-      queue.push(4);
-      queue.push(5);
+      assert!(queue.push(4).is_none());
+      assert!(queue.push(5).is_none());
 
-      assert_eq!(stealer.take_blocking(), vec![3, 4, 5]);
+      assert_eq!(stealer.to_vec(), vec![3, 4, 5]);
     });
   }
 
@@ -658,8 +605,7 @@ mod tests {
 
       let batch: Vec<i32> = stealers
         .into_iter()
-        .rev()
-        .flat_map(|stealer| stealer.take_blocking())
+        .flat_map(|stealer| stealer.to_vec())
         .collect();
 
       let expected = (0..128).collect::<Vec<i32>>();
@@ -668,24 +614,8 @@ mod tests {
     });
   }
 
-  #[cfg(not(loom))]
-  #[tokio::test]
-  async fn stealer_takes() {
-    let queue = Worker::new();
-    let stealer = queue.push(0).unwrap();
-
-    for i in 1..1024 {
-      queue.push(i);
-    }
-
-    let batch = stealer.take().await;
-    let expected = (0..1024).collect::<Vec<i32>>();
-
-    assert_eq!(batch, expected);
-  }
-
   #[test]
-  fn stealer_takes_blocking() {
+  fn stealer_takes() {
     model!({
       let queue = Worker::new();
       let stealer = queue.push(0).unwrap();
@@ -695,29 +625,11 @@ mod tests {
       }
 
       thread::spawn(move || {
-        stealer.take_blocking();
+        stealer.to_vec();
       })
       .join()
       .unwrap();
     });
-  }
-
-  #[cfg(not(loom))]
-  #[tokio::test]
-  async fn worker_drops() {
-    let queue = Worker::new();
-    let stealer = queue.push(0).unwrap();
-
-    for i in 1..128 {
-      queue.push(i);
-    }
-
-    drop(queue);
-
-    let batch = stealer.take().await;
-    let expected = (0..128).collect::<Vec<i32>>();
-
-    assert_eq!(batch, expected);
   }
 
   #[cfg(loom)]
@@ -733,7 +645,7 @@ mod tests {
 
       drop(queue);
 
-      let batch = stealer.take_blocking();
+      let batch = stealer.to_vec();
       let expected = (0..128).collect::<Vec<i32>>();
 
       assert_eq!(batch, expected);

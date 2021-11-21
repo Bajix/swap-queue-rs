@@ -25,7 +25,7 @@ mod bench_swap_queue {
       QUEUE.with(|queue| {
         if let Some(stealer) = queue.push((i, tx)) {
           Handle::current().spawn(async move {
-            let batch = stealer.take().await;
+            let batch = stealer.to_vec();
 
             batch.into_iter().for_each(|(i, tx)| {
               tx.send(i).ok();
@@ -107,16 +107,14 @@ mod bench_tokio {
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     Handle::current().spawn(async move {
-      loop {
-        if let Some(task) = rx.recv().await {
-          let batch: Vec<(u64, oneshot::Sender<u64>)> = std::iter::once(task)
-            .chain(std::iter::from_fn(|| rx.try_recv().ok()))
-            .collect();
+      while let Some(task) = rx.recv().await {
+        let batch: Vec<(u64, oneshot::Sender<u64>)> = std::iter::once(task)
+          .chain(std::iter::from_fn(|| rx.try_recv().ok()))
+          .collect();
 
-          batch.into_iter().for_each(|(i, tx)| {
-            tx.send(i).ok();
-          });
-        }
+        batch.into_iter().for_each(|(i, tx)| {
+          tx.send(i).ok();
+        });
       }
     });
 
@@ -153,16 +151,14 @@ mod bench_flume {
     let (tx, rx) = flume::unbounded();
 
     Handle::current().spawn(async move {
-      loop {
-        if let Some(task) = rx.recv_async().await.ok() {
-          let batch: Vec<(u64, oneshot::Sender<u64>)> = std::iter::once(task)
-            .chain(std::iter::from_fn(|| rx.try_recv().ok()))
-            .collect();
+      while let Some(task) = rx.recv_async().await.ok() {
+        let batch: Vec<(u64, oneshot::Sender<u64>)> = std::iter::once(task)
+          .chain(std::iter::from_fn(|| rx.try_recv().ok()))
+          .collect();
 
-          batch.into_iter().for_each(|(i, tx)| {
-            tx.send(i).ok();
-          });
-        }
+        batch.into_iter().for_each(|(i, tx)| {
+          tx.send(i).ok();
+        });
       }
     });
 
@@ -288,7 +284,7 @@ fn criterion_benchmark(c: &mut Criterion) {
 
             stealer
           },
-          |stealer| stealer.take_blocking(),
+          |stealer| stealer.to_vec(),
           BatchSize::PerIteration,
         );
       },

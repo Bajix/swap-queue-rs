@@ -35,7 +35,7 @@ async fn push_echo(i: u64) -> u64 {
       if let Some(stealer) = queue.push((i, tx)) {
         Handle::current().spawn(async move {
           // Take the underlying buffer in entirety; the next push will return a new Stealer
-          let batch = stealer.take().await;
+          let batch = stealer.to_vec();
 
           // Some sort of batched operation, such as a database query
 
