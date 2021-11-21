@@ -201,7 +201,7 @@ fn criterion_benchmark(c: &mut Criterion) {
   for n in 0..=12 {
     let batch_size: u64 = 1 << n;
     push_tests.bench_with_input(
-      BenchmarkId::new("swap_queue", batch_size),
+      BenchmarkId::new("swap-queue", batch_size),
       &batch_size,
       |b, batch_size| {
         b.iter_batched(
@@ -275,7 +275,7 @@ fn criterion_benchmark(c: &mut Criterion) {
   for n in 0..=12 {
     let batch_size: u64 = 1 << n;
     take_tests.bench_with_input(
-      BenchmarkId::new("swap_queue", batch_size),
+      BenchmarkId::new("swap-queue", batch_size),
       &batch_size,
       |b, batch_size| {
         b.iter_batched(
@@ -375,7 +375,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     let batch_size: u64 = 1 << n;
 
     async_batching_tests.bench_with_input(
-      BenchmarkId::new("swap_queue", batch_size),
+      BenchmarkId::new("swap-queue", batch_size),
       &batch_size,
       |b, batch_size| {
         b.to_async(&rt)
