@@ -211,7 +211,7 @@ fn criterion_benchmark(c: &mut Criterion) {
               queue.push(i);
             }
           },
-          BatchSize::SmallInput,
+          BatchSize::PerIteration,
         )
       },
     );
@@ -227,7 +227,7 @@ fn criterion_benchmark(c: &mut Criterion) {
               queue.push(i);
             }
           },
-          BatchSize::SmallInput,
+          BatchSize::PerIteration,
         )
       },
     );
@@ -243,7 +243,7 @@ fn criterion_benchmark(c: &mut Criterion) {
               tx.send(i).ok();
             }
           },
-          BatchSize::SmallInput,
+          BatchSize::PerIteration,
         )
       },
     );
@@ -259,7 +259,7 @@ fn criterion_benchmark(c: &mut Criterion) {
               tx.send(i).ok();
             }
           },
-          BatchSize::SmallInput,
+          BatchSize::PerIteration,
         )
       },
     );
@@ -289,7 +289,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             stealer
           },
           |stealer| stealer.take_blocking(),
-          BatchSize::SmallInput,
+          BatchSize::PerIteration,
         );
       },
     );
@@ -318,7 +318,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             })
             .collect();
           },
-          BatchSize::SmallInput,
+          BatchSize::PerIteration,
         );
       },
     );
@@ -338,7 +338,7 @@ fn criterion_benchmark(c: &mut Criterion) {
           |rx| {
             let _: Vec<u64> = rx.try_iter().collect();
           },
-          BatchSize::SmallInput,
+          BatchSize::PerIteration,
         );
       },
     );
@@ -358,7 +358,7 @@ fn criterion_benchmark(c: &mut Criterion) {
           |mut rx| {
             let _: Vec<u64> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
           },
-          BatchSize::SmallInput,
+          BatchSize::PerIteration,
         );
       },
     );
