@@ -217,7 +217,12 @@ impl<T> Worker<T> {
   /// let w = Worker::<i32>::new();
   /// ```
   pub fn new() -> Worker<T> {
-    let buffer = Buffer::alloc(0, MIN_CAP);
+    // Placeholder buffer to force initial buffer swap
+    let buffer = Buffer {
+      slot: BUFFER_IDX,
+      ptr: std::ptr::null_mut(),
+      cap: MIN_CAP,
+    };
 
     let inner = Arc::new(CachePadded::new(Inner {
       slot: AtomicUsize::new(0),
@@ -253,7 +258,12 @@ impl<T> Worker<T> {
       "batch_size must be a power of 2"
     );
 
-    let buffer = Buffer::alloc(0, MIN_CAP);
+    // Placeholder buffer to force initial buffer swap
+    let buffer = Buffer {
+      slot: BUFFER_IDX,
+      ptr: std::ptr::null_mut(),
+      cap: MIN_CAP,
+    };
 
     let inner = Arc::new(CachePadded::new(Inner {
       slot: AtomicUsize::new(0),
@@ -400,24 +410,6 @@ impl<T> Worker<T> {
           } else {
             Some(Stealer::Owner(batch))
           }
-        }
-        _ if index.eq(&0) => {
-          unsafe {
-            buffer.write(0, task);
-          }
-
-          self
-            .inner
-            .slot
-            .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
-
-          let (tx, rx) = channel();
-          self.tx.set(Some(tx));
-
-          Some(Stealer::Taker(StealHandle {
-            rx,
-            inner: self.inner.clone(),
-          }))
         }
         _ => {
           unsafe {
