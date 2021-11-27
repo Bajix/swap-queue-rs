@@ -340,7 +340,7 @@ impl<T> Worker<T> {
         .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
 
       Some(Stealer::Taker(StealHandle {
-        inner: Some(self.inner.clone()),
+        inner: self.inner.clone(),
       }))
     } else {
       let index = slot_delta(slot, buffer.slot);
@@ -360,7 +360,7 @@ impl<T> Worker<T> {
           // Stealer expressed intention to take buffer by changing the buffer index, and is waiting on Worker to notify upon completion of the current write in progress
           if ((slot ^ buffer.slot) & BUFFER_IDX).eq(&BUFFER_IDX) {
             Some(Stealer::Taker(StealHandle {
-              inner: Some(self.inner.clone()),
+              inner: self.inner.clone(),
             }))
           } else {
             None
@@ -378,7 +378,7 @@ impl<T> Worker<T> {
 
           if ((slot ^ buffer.slot) & BUFFER_IDX).eq(&BUFFER_IDX) {
             Some(Stealer::Taker(StealHandle {
-              inner: Some(self.inner.clone()),
+              inner: self.inner.clone(),
             }))
           } else {
             let old = self.replace_buffer(&mut buffer, slot + (1 << FLAGS_SHIFT), *batch_size);
@@ -398,7 +398,7 @@ impl<T> Worker<T> {
 
           if ((slot ^ buffer.slot) & BUFFER_IDX).eq(&BUFFER_IDX) {
             Some(Stealer::Taker(StealHandle {
-              inner: Some(self.inner.clone()),
+              inner: self.inner.clone(),
             }))
           } else {
             None
@@ -423,44 +423,7 @@ impl<T> fmt::Debug for Worker<T> {
 #[doc(hidden)]
 pub struct StealHandle<T> {
   /// A reference to the inner representation of the queue.
-  inner: Option<Arc<CachePadded<Inner<T>>>>,
-}
-
-impl<T> Drop for StealHandle<T> {
-  fn drop(&mut self) {
-    let inner = std::mem::replace(&mut self.inner, None);
-
-    if let Some(inner) = inner {
-      let slot = inner.slot.fetch_xor(BUFFER_IDX, Ordering::Relaxed);
-
-      if slot & WRITE_IN_PROGRESS == WRITE_IN_PROGRESS {
-        let backoff = Backoff::new();
-
-        backoff.snooze();
-
-        while (inner.slot.load(Ordering::Acquire) & WRITE_IN_PROGRESS).eq(&WRITE_IN_PROGRESS) {
-          backoff.snooze();
-        }
-      }
-
-      let guard = &epoch::pin();
-
-      let buffer = inner.get_buffer(slot).load_consume(guard);
-
-      unsafe {
-        let buffer = *buffer.into_owned();
-        let length = slot_delta(slot, buffer.slot);
-
-        // Go through the buffer from front to back and drop all tasks in the queue.
-        for i in 0..length {
-          buffer.at(i).drop_in_place();
-        }
-
-        // Free the memory allocated by the buffer.
-        buffer.dealloc();
-      }
-    }
-  }
+  inner: Arc<CachePadded<Inner<T>>>,
 }
 
 /// Stealers swap out and take ownership of buffers in entirety from Workers
@@ -477,33 +440,30 @@ unsafe impl<T: Send> Sync for Stealer<T> {}
 impl<T> Stealer<T> {
   /// Take the entire queue by swapping the underlying buffer and converting back into a `Vec<T>`
   pub fn to_vec(mut self) -> Vec<T> {
-    if let Stealer::Taker(StealHandle { ref mut inner }) = &mut self {
-      let inner = inner.take().unwrap();
+    match self {
+      Stealer::Taker(StealHandle { ref mut inner }) => {
+        let slot = inner.slot.fetch_xor(BUFFER_IDX, Ordering::Relaxed);
 
-      let slot = inner.slot.fetch_xor(BUFFER_IDX, Ordering::Relaxed);
+        if (slot & WRITE_IN_PROGRESS).eq(&WRITE_IN_PROGRESS) {
+          let backoff = Backoff::new();
 
-      if (slot & WRITE_IN_PROGRESS).eq(&WRITE_IN_PROGRESS) {
-        let backoff = Backoff::new();
-
-        backoff.snooze();
-
-        while (inner.slot.load(Ordering::Acquire) & WRITE_IN_PROGRESS).eq(&WRITE_IN_PROGRESS) {
           backoff.snooze();
+
+          while (inner.slot.load(Ordering::Acquire) & WRITE_IN_PROGRESS).eq(&WRITE_IN_PROGRESS) {
+            backoff.snooze();
+          }
+        }
+
+        let guard = &epoch::pin();
+
+        let buffer = inner.get_buffer(slot).load_consume(guard);
+
+        unsafe {
+          let buffer = *buffer.into_owned();
+          buffer.to_vec(slot_delta(slot, buffer.slot))
         }
       }
-
-      let guard = &epoch::pin();
-
-      let buffer = inner.get_buffer(slot).load_consume(guard);
-
-      unsafe {
-        let buffer = *buffer.into_owned();
-        buffer.to_vec(slot_delta(slot, buffer.slot))
-      }
-    } else if let Stealer::Owner(batch) = self {
-      batch
-    } else {
-      unreachable!()
+      Stealer::Owner(batch) => batch,
     }
   }
 }
