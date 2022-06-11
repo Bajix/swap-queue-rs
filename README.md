@@ -10,7 +10,7 @@ A lock-free thread-owned queue whereby tasks are taken by stealers in entirety v
 ## Example
 
 ```rust
-use swap_queue::Worker;
+use swap_queue::SwapQueue;
 use tokio::{
   runtime::Handle,
   sync::oneshot::{channel, Sender},
@@ -20,9 +20,9 @@ use tokio::{
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
-// Worker needs to be thread local because it is !Sync
+// SwapQueue needs to be thread local because it is !Sync
 thread_local! {
-  static QUEUE: Worker<(u64, Sender<u64>)> = Worker::new();
+  static QUEUE: SwapQueue<(u64, Sender<u64>)> = SwapQueue::new();
 }
 
 // This mechanism will batch optimally without overhead within an async-context because spawn will happen after things already scheduled
@@ -35,7 +35,7 @@ async fn push_echo(i: u64) -> u64 {
       if let Some(stealer) = queue.push((i, tx)) {
         Handle::current().spawn(async move {
           // Take the underlying buffer in entirety; the next push will return a new Stealer
-          let batch = stealer.take().await;
+          let batch = stealer.await;
 
           // Some sort of batched operation, such as a database query
 
@@ -73,4 +73,4 @@ Benchmarks ran on t4g.medium using ami-06391d741144b83c2
 
 <img src="https://raw.githubusercontent.com/Bajix/swap-queue-benchmarks/master/Take/report/lines.svg" alt="Benchmarks, 1024 tasks" width="100%"/>
 
-CI tested under ThreadSanitizer, LeakSanitizer, Miri and Loom.
+CI tested under ThreadSanitizer, LeakSanitizer and Miri.

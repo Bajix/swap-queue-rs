@@ -1,10 +1,10 @@
 //!
-//! A lock-free thread-owned queue whereby tasks are taken by stealers in entirety via buffer swapping. This is meant to be used [`thread_local`] paired with [`tokio::task::spawn`] as a constant-time take-all batching mechanism that outperforms [`crossbeam_deque::Worker`](https://docs.rs/crossbeam-deque/0.8.1/crossbeam_deque/struct.Worker.html), and [`tokio::sync::mpsc`] for batching.
+//! A lock-free thread-owned queue whereby tasks are taken by stealers in entirety via buffer swapping. This is meant to be used [`thread_local`] paired with [`tokio::task::spawn`] as a constant-time take-all batching mechanism that outperforms [`crossbeam_deque::SwapQueue`](https://docs.rs/crossbeam-deque/0.8.1/crossbeam_deque/struct.SwapQueue.html), and [`tokio::sync::mpsc`] for batching.
 //!
 //! ## Example
 //!
 //! ```
-//! use swap_queue::Worker;
+//! use swap_queue::SwapQueue;
 //! use tokio::{
 //!   runtime::Handle,
 //!   sync::oneshot::{channel, Sender},
@@ -14,9 +14,9 @@
 //! #[global_allocator]
 //! static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 //!
-//! // Worker needs to be thread local because it is !Sync
+//! // SwapQueue needs to be thread local because it is !Sync
 //! thread_local! {
-//!   static QUEUE: Worker<(u64, Sender<u64>)> = Worker::new();
+//!   static QUEUE: SwapQueue<(u64, Sender<u64>)> = SwapQueue::new();
 //! }
 //!
 //! // This mechanism will batch optimally without overhead within an async-context because spawn will happen after things already scheduled
@@ -29,7 +29,7 @@
 //!       if let Some(stealer) = queue.push((i, tx)) {
 //!         Handle::current().spawn(async move {
 //!           // Take the underlying buffer in entirety; the next push will return a new Stealer
-//!           let batch = stealer.take().await;
+//!           let batch = stealer.await;
 //!
 //!           // Some sort of batched operation, such as a database query
 //!
@@ -47,27 +47,34 @@
 //! }
 //! ```
 
-use crossbeam_epoch::{self as epoch, Atomic, Owned};
-use crossbeam_utils::CachePadded;
-
-use futures::executor::block_on;
-use std::{cell::Cell, fmt, marker::PhantomData, mem, ptr, sync::Arc};
-use tokio::sync::oneshot::{channel, Receiver, Sender};
-
-#[cfg(loom)]
-use loom::sync::atomic::{AtomicUsize, Ordering};
-
-#[cfg(not(loom))]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use cache_padded::CachePadded;
+use std::{
+  cell::{RefCell, UnsafeCell},
+  fmt,
+  future::Future,
+  mem::{self, MaybeUninit},
+  pin::Pin,
+  ptr,
+  sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+  },
+  task::{Context, Poll, Waker},
+};
 
 // Current buffer index
-const BUFFER_IDX: usize = 1 << 0;
+const LANE: usize = 1 << 0;
+
+// Phase for determining reclamation
+const RECLAMATION_PHASE: usize = 1 << 1;
+
+const DROP_BUFFER: usize = LANE | RECLAMATION_PHASE;
 
 // Designates that write is in progress
-const WRITE_IN_PROGRESS: usize = 1 << 1;
+const WRITE_IN_PROGRESS: usize = 1 << 2;
 
 // Designates how many bits are set aside for flags
-const FLAGS_SHIFT: usize = 1;
+const FLAGS_SHIFT: usize = 2;
 
 // Slot increments both for reads and writes, therefore we shift slot an extra bit to extract length
 const LENGTH_SHIFT: usize = FLAGS_SHIFT + 1;
@@ -80,9 +87,6 @@ const MIN_CAP: usize = 64;
 /// This is just a pointer to the buffer and its length - dropping an instance of this struct will
 /// *not* deallocate the buffer.
 struct Buffer<T> {
-  /// Slot that represents the index offset and buffer idx
-  slot: usize,
-
   /// Pointer to the allocated memory.
   ptr: *mut T,
 
@@ -91,36 +95,41 @@ struct Buffer<T> {
 }
 
 unsafe impl<T: Send> Send for Buffer<T> {}
-unsafe impl<T: Send> Sync for Buffer<T> {}
+unsafe impl<T: Sync> Sync for Buffer<T> {}
 
 impl<T> Buffer<T> {
   /// Allocates a new buffer with the specified capacity.
-  fn alloc(slot: usize, cap: usize) -> Buffer<T> {
+  #[inline]
+  fn alloc(cap: usize) -> Buffer<T> {
     debug_assert_eq!(cap, cap.next_power_of_two());
 
     let mut v = Vec::with_capacity(cap);
     let ptr = v.as_mut_ptr();
     mem::forget(v);
 
-    Buffer { slot, ptr, cap }
+    Buffer { ptr, cap }
   }
 
   /// Deallocates the buffer.
+  #[inline]
   unsafe fn dealloc(self) {
     drop(Vec::from_raw_parts(self.ptr, 0, self.cap));
   }
 
   /// Returns a pointer to the task at the specified `index`.
+  #[inline]
   unsafe fn at(&self, index: usize) -> *mut T {
     // `self.cap` is always a power of two.
     self.ptr.offset((index & (self.cap - 1)) as isize)
   }
 
   /// Writes `task` into the specified `index`.
+  #[inline]
   unsafe fn write(&self, index: usize, task: T) {
     ptr::write_volatile(self.at(index), task)
   }
 
+  #[inline]
   unsafe fn to_vec(self, length: usize) -> Vec<T> {
     let Buffer { ptr, cap, .. } = self;
     Vec::from_raw_parts(ptr, length, cap)
@@ -130,16 +139,14 @@ impl<T> Buffer<T> {
 impl<T> Clone for Buffer<T> {
   fn clone(&self) -> Buffer<T> {
     Buffer {
-      slot: self.slot,
       ptr: self.ptr,
       cap: self.cap,
     }
   }
 }
 
-impl<T> Copy for Buffer<T> {}
-
-fn slot_delta(a: usize, b: usize) -> usize {
+#[inline]
+fn slot_delta(a: &usize, b: &usize) -> usize {
   if a < b {
     ((usize::MAX - b) >> LENGTH_SHIFT) + (a >> LENGTH_SHIFT)
   } else {
@@ -148,20 +155,32 @@ fn slot_delta(a: usize, b: usize) -> usize {
 }
 
 struct Inner<T> {
-  slot: AtomicUsize,
+  slot: CachePadded<AtomicUsize>,
   buffers: (
-    CachePadded<Atomic<Buffer<T>>>,
-    CachePadded<Atomic<Buffer<T>>>,
+    UnsafeCell<MaybeUninit<Buffer<T>>>,
+    UnsafeCell<MaybeUninit<Buffer<T>>>,
   ),
+  waker: UnsafeCell<MaybeUninit<Waker>>,
 }
 
 impl<T> Inner<T> {
-  fn get_buffer(&self, slot: usize) -> &CachePadded<Atomic<Buffer<T>>> {
-    if slot & BUFFER_IDX == 0 {
+  #[inline]
+  fn buffer(&self, slot: &usize) -> &UnsafeCell<MaybeUninit<Buffer<T>>> {
+    if slot & LANE == 0 {
       &self.buffers.0
     } else {
       &self.buffers.1
     }
+  }
+
+  #[inline]
+  unsafe fn take_buffer(&self, slot: &usize) -> Buffer<T> {
+    mem::replace(&mut *self.buffer(slot).get(), MaybeUninit::uninit()).assume_init()
+  }
+
+  #[inline]
+  unsafe fn take_waker(&self) -> Waker {
+    mem::replace(&mut *self.waker.get(), MaybeUninit::uninit()).assume_init()
   }
 }
 
@@ -170,13 +189,13 @@ impl<T> Inner<T> {
 /// # Examples
 ///
 /// ```
-/// use swap_queue::Worker;
+/// use swap_queue::SwapQueue;
 ///
-/// let w = Worker::new();
+/// let w = SwapQueue::new();
 /// let s = w.push(1).unwrap();
 /// w.push(2);
 /// w.push(3);
-/// // this is non-blocking because it's called on the same thread as Worker; a write in progress is not possible
+/// // this is non-blocking because it's called on the same thread as SwapQueue; a write in progress is not possible
 /// assert_eq!(s.take_blocking(), vec![1, 2, 3]);
 ///
 /// let s = w.push(4).unwrap();
@@ -187,383 +206,260 @@ impl<T> Inner<T> {
 /// assert_eq!(batch, vec![4, 5, 6]);
 /// ```
 
-enum Flavor {
-  Unbounded,
-  AutoBatched { batch_size: usize },
-}
-
-pub struct Worker<T> {
-  flavor: Flavor,
+pub struct SwapQueue<T: Sized> {
+  /// Slot that represents the base index offset and buffer idx / reclamation phase
+  base_slot: RefCell<usize>,
   /// A reference to the inner representation of the queue.
-  inner: Arc<CachePadded<Inner<T>>>,
-  /// A copy of `inner.buffer` for quick access.
-  buffer: Cell<Buffer<T>>,
-  /// Send handle corresponding to the current Stealer
-  tx: Cell<Option<Sender<Vec<T>>>>,
-  /// Indicates that the worker cannot be shared among threads.
-  _marker: PhantomData<*mut ()>,
+  inner: Arc<Inner<T>>,
 }
 
-unsafe impl<T: Send> Send for Worker<T> {}
+unsafe impl<T: Send> Send for SwapQueue<T> {}
 
-impl<T> Worker<T> {
-  /// Creates a new Worker queue.
+impl<T: Sized> SwapQueue<T> {
+  /// Creates a new SwapQueue queue.
   ///
   /// # Examples
   ///
   /// ```
-  /// use swap_queue::Worker;
+  /// use swap_queue::SwapQueue;
   ///
-  /// let w = Worker::<i32>::new();
+  /// let queue = SwapQueue::<i32>::new();
   /// ```
-  pub fn new() -> Worker<T> {
-    // Placeholder buffer to force initial buffer swap
-    let buffer = Buffer {
-      slot: BUFFER_IDX,
-      ptr: std::ptr::null_mut(),
-      cap: MIN_CAP,
-    };
-
-    let inner = Arc::new(CachePadded::new(Inner {
-      slot: AtomicUsize::new(0),
+  pub fn new() -> SwapQueue<T> {
+    let inner = Arc::new(Inner {
+      slot: CachePadded::new(AtomicUsize::new(0)),
       buffers: (
-        CachePadded::new(Atomic::new(buffer)),
-        CachePadded::new(Atomic::null()),
+        UnsafeCell::new(MaybeUninit::uninit()),
+        UnsafeCell::new(MaybeUninit::uninit()),
       ),
-    }));
+      waker: UnsafeCell::new(MaybeUninit::uninit()),
+    });
 
-    Worker {
-      flavor: Flavor::Unbounded,
+    SwapQueue {
+      // Whenever LANE is out of sync during a push, a buffer is allocated and a stealer issued
+      base_slot: RefCell::new(LANE),
       inner,
-      buffer: Cell::new(buffer),
-      tx: Cell::new(None),
-      _marker: PhantomData,
     }
   }
 
-  /// Creates an auto-batched Worker queue with fixed-length buffers. At capacity, the buffer is swapped out and ownership taken by the returned Stealer. Batch size must be a power of 2
-  ///
-  /// # Examples
-  ///
-  /// ```
-  /// use swap_queue::Worker;
-  ///
-  /// let w = Worker::<i32>::auto_batched(64);
-  /// ```
-  pub fn auto_batched(batch_size: usize) -> Worker<T> {
-    debug_assert!(batch_size.ge(&64), "batch_size must be at least 64");
-    debug_assert_eq!(
-      batch_size,
-      batch_size.next_power_of_two(),
-      "batch_size must be a power of 2"
-    );
+  /// Resizes the internal buffer to the new capacity.
+  #[inline]
+  unsafe fn resize_if_necessary(
+    &self,
+    write_index: &usize,
+    buffer_cell: &UnsafeCell<MaybeUninit<Buffer<T>>>,
+  ) {
+    let current_cap = (*buffer_cell.get()).assume_init_ref().cap;
 
-    // Placeholder buffer to force initial buffer swap
-    let buffer = Buffer {
-      slot: BUFFER_IDX,
-      ptr: std::ptr::null_mut(),
-      cap: MIN_CAP,
-    };
+    if current_cap.eq(&write_index) {
+      // Allocate a new buffer and copy data from the old buffer to the new one.
+      let new = Buffer::alloc(current_cap * 2);
 
-    let inner = Arc::new(CachePadded::new(Inner {
-      slot: AtomicUsize::new(0),
-      buffers: (
-        CachePadded::new(Atomic::new(buffer)),
-        CachePadded::new(Atomic::null()),
-      ),
-    }));
+      let buffer: &mut Buffer<T> = { (*buffer_cell.get()).assume_init_mut() };
 
-    Worker {
-      flavor: Flavor::AutoBatched { batch_size },
-      inner,
-      buffer: Cell::new(buffer),
-      tx: Cell::new(None),
-      _marker: PhantomData,
+      ptr::copy_nonoverlapping(buffer.at(0), new.at(0), current_cap);
+
+      let old = mem::replace(buffer, new);
+
+      // Here we're deallocating the old buffer without dropping individual items as the new buffer is now owner
+      old.dealloc();
     }
-  }
-
-  /// Resizes the internal buffer to the new capacity of `new_cap`.
-  unsafe fn resize(&self, buffer: &mut Buffer<T>, slot: usize) {
-    let length = slot_delta(slot, buffer.slot);
-
-    // Allocate a new buffer and copy data from the old buffer to the new one.
-    let new = Buffer::alloc(buffer.slot, buffer.cap * 2);
-
-    ptr::copy_nonoverlapping(buffer.at(0), new.at(0), length);
-
-    self.buffer.set(new);
-
-    let old = std::mem::replace(buffer, new);
-
-    self
-      .inner
-      .get_buffer(slot)
-      .store(Owned::new(new), Ordering::Release);
-
-    old.dealloc();
-  }
-
-  fn replace_buffer(&self, buffer: &mut Buffer<T>, slot: usize, cap: usize) -> Buffer<T> {
-    let new = Buffer::alloc(slot.to_owned(), cap);
-
-    self
-      .inner
-      .get_buffer(slot)
-      .store(Owned::new(new), Ordering::Release);
-
-    self.buffer.set(new);
-
-    std::mem::replace(buffer, new)
   }
 
   /// Write to the next slot, swapping buffers as necessary and returning a Stealer at the start of a new batch
   pub fn push(&self, task: T) -> Option<Stealer<T>> {
-    let slot = self
-      .inner
-      .slot
-      .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
+    let inner = self.inner.as_ref();
+    let slot = inner.slot.fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
+    let buffer_cell = inner.buffer(&slot);
 
-    let mut buffer = self.buffer.get();
-
-    // BUFFER_IDX bit changed, therefore buffer was stolen
-    if ((slot ^ buffer.slot) & BUFFER_IDX).eq(&BUFFER_IDX) {
-      buffer = Buffer::alloc(slot, buffer.cap);
-
-      self
-        .inner
-        .get_buffer(slot)
-        .store(Owned::new(buffer), Ordering::Release);
-
-      self.buffer.set(buffer);
+    // Buffer was stolen or hasn't been initialized
+    if ((slot ^ *self.base_slot.borrow()) & LANE).eq(&LANE) {
+      let buffer = Buffer::alloc(MIN_CAP);
 
       unsafe {
         buffer.write(0, task);
+        buffer_cell.get().write(MaybeUninit::new(buffer));
       }
 
-      // There can be no stealer at this point, so no need to check IDX XOR
-      self
-        .inner
-        .slot
-        .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
+      {
+        *self.base_slot.borrow_mut() = slot;
+      }
 
-      let (tx, rx) = channel();
-      self.tx.set(Some(tx));
+      inner.slot.fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
 
-      Some(Stealer::Taker(StealHandle {
-        rx,
-        inner: self.inner.clone(),
-      }))
+      Some(Stealer::new(slot, self.inner.clone()))
     } else {
-      let index = slot_delta(slot, buffer.slot);
+      let index = slot_delta(&slot, &*self.base_slot.borrow());
 
-      match &self.flavor {
-        Flavor::Unbounded if index.eq(&buffer.cap) => {
+      unsafe {
+        self.resize_if_necessary(&index, buffer_cell);
+        (*buffer_cell.get()).assume_init_ref().write(index, task);
+      }
+
+      let slot = inner.slot.fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
+
+      match (slot ^ *self.base_slot.borrow()) & (LANE | RECLAMATION_PHASE) {
+        // Stealer dropped
+        DROP_BUFFER => {
           unsafe {
-            self.resize(&mut buffer, slot);
-            buffer.write(index, task);
+            let buffer = mem::replace(&mut *buffer_cell.get(), MaybeUninit::uninit()).assume_init();
+
+            // Go through the buffer from front to back and drop all tasks in the queue.
+            for i in 0..index {
+              buffer.at(i).drop_in_place();
+            }
+
+            // Free the memory allocated by the buffer.
+            buffer.dealloc();
           }
 
-          let slot = self
-            .inner
-            .slot
-            .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
-
-          // Stealer expressed intention to take buffer by changing the buffer index, and is waiting on Worker to send buffer upon completion of the current write in progress
-          if ((slot ^ buffer.slot) & BUFFER_IDX).eq(&BUFFER_IDX) {
-            let (tx, rx) = channel();
-            let tx = self.tx.replace(Some(tx)).unwrap();
-
-            // Send buffer as vec to receiver
-            tx.send(unsafe { buffer.to_vec(index) }).ok();
-
-            Some(Stealer::Taker(StealHandle {
-              rx,
-              inner: self.inner.clone(),
-            }))
-          } else {
-            None
-          }
+          None
         }
-        Flavor::AutoBatched { batch_size } if index.eq(batch_size) => {
-          let old = self.replace_buffer(&mut buffer, slot, *batch_size);
-          let batch = unsafe { old.to_vec(*batch_size) };
-
+        // Stealer waiting to wake / take
+        LANE => {
           unsafe {
-            buffer.write(0, task);
+            inner.take_waker().wake();
           }
 
-          let slot = self
-            .inner
-            .slot
-            .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
-
-          if ((slot ^ buffer.slot) & BUFFER_IDX).eq(&BUFFER_IDX) {
-            let (tx, rx) = channel();
-            let tx = self.tx.replace(Some(tx)).unwrap();
-
-            tx.send(batch).ok();
-
-            Some(Stealer::Taker(StealHandle {
-              rx,
-              inner: self.inner.clone(),
-            }))
-          } else {
-            Some(Stealer::Owner(batch))
-          }
+          None
         }
-        _ => {
-          unsafe {
-            buffer.write(index, task);
-          }
-
-          let slot = self
-            .inner
-            .slot
-            .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
-
-          if ((slot ^ buffer.slot) & BUFFER_IDX).eq(&BUFFER_IDX) {
-            let (tx, rx) = channel();
-            let tx = self.tx.replace(Some(tx)).unwrap();
-
-            // Send buffer as vec to receiver
-            tx.send(unsafe { buffer.to_vec(index) }).ok();
-
-            Some(Stealer::Taker(StealHandle {
-              rx,
-              inner: self.inner.clone(),
-            }))
-          } else {
-            None
-          }
-        }
+        _ => None,
       }
     }
   }
 }
 
-impl<T> Default for Worker<T> {
+impl<T> Default for SwapQueue<T> {
   fn default() -> Self {
     Self::new()
   }
 }
 
-impl<T> fmt::Debug for Worker<T> {
+impl<T> fmt::Debug for SwapQueue<T> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.pad("Worker { .. }")
+    f.pad("SwapQueue { .. }")
   }
 }
 
-impl<T> Drop for Worker<T> {
-  fn drop(&mut self) {
-    // By leaving this as indefinitely write in progress the Stealer will always receive from the oneshot::Sender
-    let slot = self
-      .inner
-      .slot
-      .fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
-
-    let buffer = self.buffer.get();
-
-    // Is buffer still current? (If not Stealer has already taken buffer)
-    if slot & BUFFER_IDX == buffer.slot & BUFFER_IDX {
-      let length = slot_delta(slot, buffer.slot);
-
-      // Send to Stealer if able
-      if let Some(tx) = self.tx.replace(None) {
-        if let Err(queue) = tx.send(unsafe { buffer.to_vec(length) }) {
-          drop(queue);
-        }
-      } else {
-        // Otherwise deallocate everything
-        unsafe {
-          // Go through the buffer from front to back and drop all tasks in the queue.
-          for i in 0..length {
-            buffer.at(i).drop_in_place();
-          }
-
-          // Free the memory allocated by the buffer.
-          buffer.dealloc();
-        }
-      }
-    }
-  }
+pub enum State {
+  Uninitialized,
+  Pending { slot: usize },
+  Received,
 }
-
-#[doc(hidden)]
-pub struct StealHandle<T> {
-  /// Buffer receiver to be used when waiting on writes
-  rx: Receiver<Vec<T>>,
-  /// A reference to the inner representation of the queue.
-  inner: Arc<CachePadded<Inner<T>>>,
-}
-
-/// Stealers swap out and take ownership of buffers in entirety from Workers
-pub enum Stealer<T> {
-  /// Stealer was created with an owned batch that can simply be unwrapped
-  Owner(Vec<T>),
-  /// A Steal Handle buffer swaps either by taking the buffer directly or by awaiting the Worker to send on write completion
-  Taker(StealHandle<T>),
+pub struct Stealer<T> {
+  /// Current polling state
+  state: State,
+  /// Slot that represents the base index offset and buffer idx / reclamation phase
+  base_slot: usize,
+  /// A pointer to the inner representation of the queue.
+  inner: Arc<Inner<T>>,
 }
 
 unsafe impl<T: Send> Send for Stealer<T> {}
-unsafe impl<T: Send> Sync for Stealer<T> {}
+unsafe impl<T: Sync> Sync for Stealer<T> {}
 
 impl<T> Stealer<T> {
-  /// Take the entire queue by swapping the underlying buffer and converting back into a `Vec<T>` or by waiting to receive the buffer from the Worker if a write was in progress.
-  pub async fn take(self) -> Vec<T> {
-    match self {
-      Stealer::Owner(batch) => batch,
-      Stealer::Taker(StealHandle { rx, inner }) => {
-        let slot = inner.slot.fetch_xor(BUFFER_IDX, Ordering::Relaxed);
-
-        // Worker will see the buffer has swapped when confirming length increment
-        if slot & WRITE_IN_PROGRESS == WRITE_IN_PROGRESS {
-          // Writer can never be dropped mid-write, therefore RecvError cannot occur
-          rx.await.unwrap()
-        } else {
-          let guard = &epoch::pin();
-
-          let buffer = inner.get_buffer(slot).load_consume(guard);
-
-          unsafe {
-            let buffer = *buffer.into_owned();
-            buffer.to_vec(slot_delta(slot, buffer.slot))
-          }
-        }
-      }
+  #[inline]
+  fn new(base_slot: usize, inner: Arc<Inner<T>>) -> Self {
+    Stealer {
+      base_slot,
+      inner,
+      state: State::Uninitialized,
     }
   }
+}
 
-  /// Take the entire queue by swapping the underlying buffer and converting into a `Vec<T>` or by blocking to receive from the Worker if a write was in progress. This is always non-blocking when called on the same thread as the Worker
-  pub fn take_blocking(self) -> Vec<T> {
-    match self {
-      Stealer::Owner(batch) => batch,
-      Stealer::Taker(StealHandle { rx, inner }) => {
-        let slot = inner.slot.fetch_xor(BUFFER_IDX, Ordering::Relaxed);
+impl<T> Future for Stealer<T> {
+  type Output = Vec<T>;
+  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    let inner = self.inner.as_ref();
 
-        // Worker will see the buffer has swapped when confirming length increment
-        // It's not possible for this to be write in progress when called from the same thread as the queue
-        if slot & WRITE_IN_PROGRESS == WRITE_IN_PROGRESS {
-          // Writer can never be dropped mid-write, therefore RecvError cannot occur
-          block_on(rx).unwrap()
+    match self.state {
+      State::Pending { slot } => {
+        let value = unsafe {
+          let buffer = inner.take_buffer(&slot);
+          let length = slot_delta(&slot, &self.base_slot);
+          buffer.to_vec(length)
+        };
+
+        unsafe {
+          self.get_unchecked_mut().state = State::Received;
+        }
+        Poll::Ready(value)
+      }
+      State::Uninitialized => {
+        unsafe {
+          inner
+            .waker
+            .get()
+            .write(MaybeUninit::new(cx.waker().clone()));
+        }
+
+        let slot = inner.slot.fetch_xor(LANE, Ordering::Relaxed);
+
+        if (slot & WRITE_IN_PROGRESS).eq(&WRITE_IN_PROGRESS) {
+          unsafe {
+            self.get_unchecked_mut().state = State::Pending { slot };
+          }
+
+          Poll::Pending
         } else {
-          let guard = &epoch::pin();
+          unsafe {
+            drop(inner.take_waker());
+          }
 
-          let buffer = inner.get_buffer(slot).load_consume(guard);
+          let value = unsafe {
+            let buffer = inner.take_buffer(&slot);
+            let length = slot_delta(&slot, &self.base_slot);
+            buffer.to_vec(length)
+          };
 
           unsafe {
-            let buffer = *buffer.into_owned();
-            buffer.to_vec(slot_delta(slot, buffer.slot))
+            self.get_unchecked_mut().state = State::Received;
           }
+
+          Poll::Ready(value)
         }
+      }
+      State::Received => {
+        unreachable!()
       }
     }
   }
 }
 
-/// Uses [`Stealer::take_blocking`]; non-blocking when called on the same thread as Worker
-impl<T> From<Stealer<T>> for Vec<T> {
-  fn from(stealer: Stealer<T>) -> Self {
-    stealer.take_blocking()
+impl<T> Drop for Stealer<T> {
+  fn drop(&mut self) {
+    match self.state {
+      // It should not be possible for Stealer to drop while pending; wake is imminent.
+      State::Pending { slot: _ } => {
+        unreachable!()
+      }
+      State::Uninitialized => {
+        let slot = self
+          .inner
+          .slot
+          .fetch_xor(LANE | RECLAMATION_PHASE, Ordering::Relaxed);
+
+        // If there is no write in progress, immediately deallocate
+        if (slot & WRITE_IN_PROGRESS).eq(&0) {
+          let index = slot_delta(&slot, &self.base_slot);
+
+          unsafe {
+            let buffer = self.inner.take_buffer(&slot);
+
+            // Go through the buffer from front to back and drop all tasks in the queue.
+            for i in 0..index {
+              buffer.at(i).drop_in_place();
+            }
+
+            // Free the memory allocated by the buffer.
+            buffer.dealloc();
+          }
+        }
+      }
+      State::Received => {}
+    }
   }
 }
 
@@ -577,127 +473,63 @@ impl<T> fmt::Debug for Stealer<T> {
 mod tests {
   use super::*;
 
-  #[cfg(loom)]
-  use loom::thread;
-
-  #[cfg(not(loom))]
-  use std::thread;
-
-  macro_rules! model {
-    ($test:block) => {
-      #[cfg(loom)]
-      loom::model(|| $test);
-
-      #[cfg(not(loom))]
-      $test
-    };
-  }
-
   #[test]
   fn slot_wraps_around() {
-    let delta = slot_delta(1 << LENGTH_SHIFT, usize::MAX);
+    let delta = slot_delta(&(1 << LENGTH_SHIFT), &usize::MAX);
 
     assert_eq!(delta, 1);
   }
 
-  #[test]
-  fn it_resizes() {
-    model!({
-      let queue = Worker::new();
-      let stealer = queue.push(0).unwrap();
+  #[tokio::test]
+  async fn it_resizes() {
+    let queue = SwapQueue::new();
+    let stealer = queue.push(0).unwrap();
 
-      for i in 1..128 {
-        queue.push(i);
-      }
+    for i in 1..128 {
+      queue.push(i);
+    }
 
-      let batch = stealer.take_blocking();
-      let expected = (0..128).collect::<Vec<i32>>();
+    let batch = stealer.await;
+    let expected = (0..128).collect::<Vec<i32>>();
 
-      assert_eq!(batch, expected);
-    });
+    assert_eq!(batch, expected);
   }
 
-  #[test]
-  fn it_makes_new_stealer_per_batch() {
-    model!({
-      let queue = Worker::new();
-      let stealer = queue.push(0).unwrap();
+  #[tokio::test]
+  async fn it_makes_new_stealer_per_batch() {
+    let queue = SwapQueue::new();
+    let stealer = queue.push(0).unwrap();
 
-      queue.push(1);
-      queue.push(2);
+    queue.push(1);
+    queue.push(2);
 
-      assert_eq!(stealer.take_blocking(), vec![0, 1, 2]);
+    assert_eq!(stealer.await, vec![0, 1, 2]);
 
-      let stealer = queue.push(3).unwrap();
-      queue.push(4);
-      queue.push(5);
+    let stealer = queue.push(3).unwrap();
+    queue.push(4);
+    queue.push(5);
 
-      assert_eq!(stealer.take_blocking(), vec![3, 4, 5]);
-    });
+    assert_eq!(stealer.await, vec![3, 4, 5]);
   }
 
-  #[test]
-  fn it_auto_batches() {
-    model!({
-      let queue = Worker::auto_batched(64);
-      let mut stealers: Vec<Stealer<i32>> = vec![];
-
-      for i in 0..128 {
-        if let Some(stealer) = queue.push(i) {
-          stealers.push(stealer);
-        }
-      }
-
-      let batch: Vec<i32> = stealers
-        .into_iter()
-        .rev()
-        .flat_map(|stealer| stealer.take_blocking())
-        .collect();
-
-      let expected = (0..128).collect::<Vec<i32>>();
-
-      assert_eq!(batch, expected);
-    });
-  }
-
-  #[cfg(not(loom))]
   #[tokio::test]
   async fn stealer_takes() {
-    let queue = Worker::new();
+    let queue = SwapQueue::new();
     let stealer = queue.push(0).unwrap();
 
     for i in 1..1024 {
       queue.push(i);
     }
 
-    let batch = stealer.take().await;
+    let batch = stealer.await;
     let expected = (0..1024).collect::<Vec<i32>>();
 
     assert_eq!(batch, expected);
   }
 
-  #[test]
-  fn stealer_takes_blocking() {
-    model!({
-      let queue = Worker::new();
-      let stealer = queue.push(0).unwrap();
-
-      for i in 1..128 {
-        queue.push(i);
-      }
-
-      thread::spawn(move || {
-        stealer.take_blocking();
-      })
-      .join()
-      .unwrap();
-    });
-  }
-
-  #[cfg(not(loom))]
   #[tokio::test]
-  async fn worker_drops() {
-    let queue = Worker::new();
+  async fn queue_drops() {
+    let queue = SwapQueue::new();
     let stealer = queue.push(0).unwrap();
 
     for i in 1..128 {
@@ -706,29 +538,9 @@ mod tests {
 
     drop(queue);
 
-    let batch = stealer.take().await;
+    let batch = stealer.await;
     let expected = (0..128).collect::<Vec<i32>>();
 
     assert_eq!(batch, expected);
-  }
-
-  #[cfg(loom)]
-  #[tokio::test]
-  async fn worker_drops() {
-    loom::model(|| {
-      let queue = Worker::new();
-      let stealer = queue.push(0).unwrap();
-
-      for i in 1..128 {
-        queue.push(i);
-      }
-
-      drop(queue);
-
-      let batch = stealer.take_blocking();
-      let expected = (0..128).collect::<Vec<i32>>();
-
-      assert_eq!(batch, expected);
-    });
   }
 }

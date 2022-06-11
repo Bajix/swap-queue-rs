@@ -8,14 +8,14 @@ static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 mod bench_swap_queue {
   use futures::future::join_all;
-  use swap_queue::Worker;
+  use swap_queue::SwapQueue;
   use tokio::{
     runtime::Handle,
     sync::oneshot::{channel, Sender},
   };
 
   thread_local! {
-    static QUEUE: Worker<(u64, Sender<u64>)> = Worker::new();
+    static QUEUE: SwapQueue<(u64, Sender<u64>)> = SwapQueue::new();
   }
 
   async fn push_echo(i: u64) -> u64 {
@@ -25,7 +25,7 @@ mod bench_swap_queue {
       QUEUE.with(|queue| {
         if let Some(stealer) = queue.push((i, tx)) {
           Handle::current().spawn(async move {
-            let batch = stealer.take().await;
+            let batch = stealer.await;
 
             batch.into_iter().for_each(|(i, tx)| {
               tx.send(i).ok();
@@ -205,7 +205,7 @@ fn criterion_benchmark(c: &mut Criterion) {
       &batch_size,
       |b, batch_size| {
         b.iter_batched(
-          || swap_queue::Worker::new(),
+          || swap_queue::SwapQueue::new(),
           |queue| {
             for i in 0..*batch_size {
               queue.push(i);
@@ -278,9 +278,9 @@ fn criterion_benchmark(c: &mut Criterion) {
       BenchmarkId::new("swap-queue", batch_size),
       &batch_size,
       |b, batch_size| {
-        b.iter_batched(
+        b.to_async(&rt).iter_batched(
           || {
-            let worker = swap_queue::Worker::new();
+            let worker = swap_queue::SwapQueue::new();
             let stealer = worker.push(0).unwrap();
             for i in 1..*batch_size {
               worker.push(i);
@@ -288,7 +288,7 @@ fn criterion_benchmark(c: &mut Criterion) {
 
             stealer
           },
-          |stealer| stealer.take_blocking(),
+          |stealer| async move { stealer.await },
           BatchSize::PerIteration,
         );
       },

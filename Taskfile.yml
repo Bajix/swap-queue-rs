@@ -9,7 +9,7 @@ sources:
 tasks:
   default:
     cmds:
-      - task: test-loom
+      - task: test-miri
 
   bench:
     env:
@@ -26,7 +26,6 @@ tasks:
     cmds:
       - task: test-doc
       - task: test-miri
-      - task: test-loom
       - task: test-sanitizer
 
   test-doc:
@@ -42,15 +41,6 @@ tasks:
       - src/**/*.rs
     env:
       MIRIFLAGS: -Zmiri-ignore-leaks
-
-  test-loom:
-    cmds:
-      - cargo test -Z build-std --target $TARGET -- --nocapture
-    sources:
-      - src/**/*.rs
-    env:
-      RUSTFLAGS: --cfg loom
-      LOOM_MAX_PREEMPTIONS: 10
 
   test-sanitizer:
     cmds:
