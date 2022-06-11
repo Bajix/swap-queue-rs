@@ -12,13 +12,13 @@ exclude = ["/target/criterion/*"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-crossbeam-epoch = "0.9.5"
-crossbeam-utils = "0.8.5"
-futures = "0.3.17"
+crossbeam-epoch = "0.9.8"
+crossbeam-utils = "0.8.8"
+futures = "0.3.21"
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 
 [target.'cfg(loom)'.dependencies]
-loom = "0.5.2"
+loom = "0.5.6"
 
 [lib]
 doctest = false
@@ -27,8 +27,8 @@ bench = false
 [dev-dependencies]
 criterion = { version = "0.3.5", features = ["async_tokio", "html_reports"] }
 crossbeam-deque = "0.8.1"
-flume = "0.10.9"
-jemallocator = "0.3.2"
+flume = "0.10.13"
+jemallocator = "0.5.0"
 
 [[bench]]
 name = "benchmarks"
