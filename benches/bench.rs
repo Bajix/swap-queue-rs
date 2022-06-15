@@ -47,6 +47,47 @@ mod bench_swap_queue {
   }
 }
 
+mod bench_swap_queue_v1 {
+  use futures::future::join_all;
+  use swap_queue_v1::Worker;
+  use tokio::{
+    runtime::Handle,
+    sync::oneshot::{channel, Sender},
+  };
+
+  thread_local! {
+    static QUEUE: Worker<(u64, Sender<u64>)> = Worker::new();
+  }
+
+  async fn push_echo(i: u64) -> u64 {
+    {
+      let (tx, rx) = channel();
+
+      QUEUE.with(|queue| {
+        if let Some(stealer) = queue.push((i, tx)) {
+          Handle::current().spawn(async move {
+            let batch = stealer.take().await;
+
+            batch.into_iter().for_each(|(i, tx)| {
+              tx.send(i).ok();
+            });
+          });
+        }
+      });
+
+      rx
+    }
+    .await
+    .unwrap()
+  }
+
+  pub async fn bench_batching(batch_size: &u64) {
+    let batch: Vec<u64> = join_all((0..*batch_size).map(|i| push_echo(i))).await;
+
+    assert_eq!(batch, (0..*batch_size).collect::<Vec<u64>>())
+  }
+}
+
 mod bench_crossbeam {
   use crossbeam_deque::{Steal, Worker};
   use futures::future::join_all;
@@ -217,6 +258,22 @@ fn criterion_benchmark(c: &mut Criterion) {
     );
 
     push_tests.bench_with_input(
+      BenchmarkId::new("swap-queue-v1.0.0", batch_size),
+      &batch_size,
+      |b, batch_size| {
+        b.iter_batched(
+          || swap_queue_v1::Worker::new(),
+          |queue| {
+            for i in 0..*batch_size {
+              queue.push(i);
+            }
+          },
+          BatchSize::PerIteration,
+        )
+      },
+    );
+
+    push_tests.bench_with_input(
       BenchmarkId::new("crossbeam", batch_size),
       &batch_size,
       |b, batch_size| {
@@ -289,6 +346,26 @@ fn criterion_benchmark(c: &mut Criterion) {
             stealer
           },
           |stealer| async move { stealer.await },
+          BatchSize::PerIteration,
+        );
+      },
+    );
+
+    take_tests.bench_with_input(
+      BenchmarkId::new("swap-queue-v1.0.0", batch_size),
+      &batch_size,
+      |b, batch_size| {
+        b.to_async(&rt).iter_batched(
+          || {
+            let worker = swap_queue_v1::Worker::new();
+            let stealer = worker.push(0).unwrap();
+            for i in 1..*batch_size {
+              worker.push(i);
+            }
+
+            stealer
+          },
+          |stealer| async move { stealer.take().await },
           BatchSize::PerIteration,
         );
       },
@@ -380,6 +457,15 @@ fn criterion_benchmark(c: &mut Criterion) {
       |b, batch_size| {
         b.to_async(&rt)
           .iter(|| bench_swap_queue::bench_batching(batch_size))
+      },
+    );
+
+    async_batching_tests.bench_with_input(
+      BenchmarkId::new("swap-queue-v1.0.0", batch_size),
+      &batch_size,
+      |b, batch_size| {
+        b.to_async(&rt)
+          .iter(|| bench_swap_queue_v1::bench_batching(batch_size))
       },
     );
 
