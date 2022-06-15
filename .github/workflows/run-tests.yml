@@ -17,7 +17,7 @@ jobs:
         target:
           # 64-bit Linux (kernel 2.6.32+, glibc 2.11+)
           - x86_64-unknown-linux-gnu
-        rust: [nightly]
+        rust: [nightly-2022-06-10]
     steps:
       - uses: actions/checkout@v2
       - uses: hecrj/setup-rust-action@v1
@@ -36,7 +36,7 @@ jobs:
         target:
           # 64-bit macOS (10.7+, Lion+)
           - x86_64-apple-darwin
-        rust: [nightly]
+        rust: [nightly-2022-06-10]
     steps:
       - uses: actions/checkout@v2
       - uses: hecrj/setup-rust-action@v1
@@ -57,7 +57,7 @@ jobs:
         target:
           # 64-bit Linux (kernel 2.6.32+, glibc 2.11+)
           - x86_64-unknown-linux-gnu
-        rust: [nightly]
+        rust: [nightly-2022-06-10]
     steps:
       - uses: actions/checkout@v2
       - uses: hecrj/setup-rust-action@v1
