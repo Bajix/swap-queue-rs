@@ -49,9 +49,10 @@
 
 use cache_padded::CachePadded;
 use std::{
-  cell::{RefCell, UnsafeCell},
+  cell::{Cell, UnsafeCell},
   fmt,
   future::Future,
+  marker::PhantomData,
   mem::{self, MaybeUninit},
   pin::Pin,
   ptr,
@@ -156,6 +157,7 @@ fn slot_delta(a: &usize, b: &usize) -> usize {
 
 struct Inner<T> {
   slot: CachePadded<AtomicUsize>,
+  base_slot: CachePadded<UnsafeCell<usize>>,
   buffers: (
     UnsafeCell<MaybeUninit<Buffer<T>>>,
     UnsafeCell<MaybeUninit<Buffer<T>>>,
@@ -207,10 +209,10 @@ impl<T> Inner<T> {
 /// ```
 
 pub struct SwapQueue<T: Sized> {
-  /// Slot that represents the base index offset and buffer idx / reclamation phase
-  base_slot: RefCell<usize>,
   /// A reference to the inner representation of the queue.
   inner: Arc<Inner<T>>,
+  /// Indicate that queue is !Sync; only a single thread can safely push
+  _marker: PhantomData<Cell<T>>,
 }
 
 unsafe impl<T: Send> Send for SwapQueue<T> {}
@@ -227,6 +229,8 @@ impl<T: Sized> SwapQueue<T> {
   /// ```
   pub fn new() -> SwapQueue<T> {
     let inner = Arc::new(Inner {
+      // Whenever LANE is out of sync during a push, a buffer is allocated and a stealer issued
+      base_slot: CachePadded::new(UnsafeCell::new(LANE)),
       slot: CachePadded::new(AtomicUsize::new(0)),
       buffers: (
         UnsafeCell::new(MaybeUninit::uninit()),
@@ -236,14 +240,12 @@ impl<T: Sized> SwapQueue<T> {
     });
 
     SwapQueue {
-      // Whenever LANE is out of sync during a push, a buffer is allocated and a stealer issued
-      base_slot: RefCell::new(LANE),
       inner,
+      _marker: PhantomData,
     }
   }
 
   /// Resizes the internal buffer to the new capacity.
-  #[inline]
   unsafe fn resize_if_necessary(
     &self,
     write_index: &usize,
@@ -251,7 +253,7 @@ impl<T: Sized> SwapQueue<T> {
   ) {
     let current_cap = (*buffer_cell.get()).assume_init_ref().cap;
 
-    if current_cap.eq(&write_index) {
+    if current_cap.eq(write_index) {
       // Allocate a new buffer and copy data from the old buffer to the new one.
       let new = Buffer::alloc(current_cap * 2);
 
@@ -273,7 +275,7 @@ impl<T: Sized> SwapQueue<T> {
     let buffer_cell = inner.buffer(&slot);
 
     // Buffer was stolen or hasn't been initialized
-    if ((slot ^ *self.base_slot.borrow()) & LANE).eq(&LANE) {
+    if ((slot ^ unsafe { &*inner.base_slot.get() }) & LANE).eq(&LANE) {
       let buffer = Buffer::alloc(MIN_CAP);
 
       unsafe {
@@ -281,15 +283,15 @@ impl<T: Sized> SwapQueue<T> {
         buffer_cell.get().write(MaybeUninit::new(buffer));
       }
 
-      {
-        *self.base_slot.borrow_mut() = slot;
+      unsafe {
+        *inner.base_slot.get() = slot;
       }
 
       inner.slot.fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
 
       Some(Stealer::new(slot, self.inner.clone()))
     } else {
-      let index = slot_delta(&slot, &*self.base_slot.borrow());
+      let index = slot_delta(&slot, unsafe { &*inner.base_slot.get() });
 
       unsafe {
         self.resize_if_necessary(&index, buffer_cell);
@@ -298,7 +300,7 @@ impl<T: Sized> SwapQueue<T> {
 
       let slot = inner.slot.fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
 
-      match (slot ^ *self.base_slot.borrow()) & (LANE | RECLAMATION_PHASE) {
+      match (slot ^ unsafe { &*inner.base_slot.get() }) & (LANE | RECLAMATION_PHASE) {
         // Stealer dropped
         DROP_BUFFER => {
           unsafe {
