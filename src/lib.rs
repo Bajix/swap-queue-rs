@@ -327,16 +327,12 @@ impl<T> Worker<T> {
 
     // If the buffer idx was swapped by the stealer while a write is in progress, then it is waiting on receive
     if idx != slot & BUFFER_IDX {
-      let (tx, rx) = channel();
-      let tx = self.tx.replace(Some(tx)).unwrap();
+      let tx = self.tx.replace(None).unwrap();
 
       // Send buffer as vec to receiver
       tx.send(unsafe { buffer.to_vec(index) }).ok();
 
-      Some(Stealer {
-        rx,
-        inner: self.inner.clone(),
-      })
+      None
     } else if index == 0 {
       let (tx, rx) = channel();
       self.tx.set(Some(tx));
