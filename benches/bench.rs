@@ -237,7 +237,7 @@ fn criterion_benchmark(c: &mut Criterion) {
   let mut push_tests = c.benchmark_group("Push");
   push_tests.warm_up_time(Duration::from_millis(10));
   push_tests.measurement_time(Duration::from_secs(1));
-  push_tests.sample_size(50);
+  push_tests.sample_size(10);
 
   for n in 0..=12 {
     let batch_size: u64 = 1 << n;
@@ -327,7 +327,7 @@ fn criterion_benchmark(c: &mut Criterion) {
   let mut take_tests = c.benchmark_group("Take");
   take_tests.warm_up_time(Duration::from_millis(10));
   take_tests.measurement_time(Duration::from_secs(1));
-  take_tests.sample_size(50);
+  take_tests.sample_size(10);
 
   for n in 0..=12 {
     let batch_size: u64 = 1 << n;
@@ -446,7 +446,7 @@ fn criterion_benchmark(c: &mut Criterion) {
   let mut async_batching_tests = c.benchmark_group("Batching");
   async_batching_tests.warm_up_time(Duration::from_millis(10));
   async_batching_tests.measurement_time(Duration::from_secs(1));
-  async_batching_tests.sample_size(50);
+  async_batching_tests.sample_size(10);
 
   for n in 0..=12 {
     let batch_size: u64 = 1 << n;
