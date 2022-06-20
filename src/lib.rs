@@ -72,13 +72,7 @@ const RECLAMATION_PHASE: usize = 1 << 1;
 const DROP_BUFFER: usize = LANE | RECLAMATION_PHASE;
 
 // Designates that write is in progress
-const WRITE_IN_PROGRESS: usize = 1 << 2;
-
-// Designates how many bits are set aside for flags
-const FLAGS_SHIFT: usize = 2;
-
-// Slot increments both for reads and writes, therefore we shift slot an extra bit to extract length
-const LENGTH_SHIFT: usize = FLAGS_SHIFT + 1;
+const WRITE_IN_PROGRESS: usize = 1 << 31;
 
 // Minimum buffer capacity.
 const MIN_CAP: usize = 64;
@@ -148,11 +142,7 @@ impl<T> Clone for Buffer<T> {
 
 #[inline]
 fn slot_delta(a: &usize, b: &usize) -> usize {
-  if a < b {
-    ((usize::MAX - b) >> LENGTH_SHIFT) + (a >> LENGTH_SHIFT)
-  } else {
-    (a >> LENGTH_SHIFT) - (b >> LENGTH_SHIFT)
-  }
+  ((a >> 32) as u32).wrapping_sub((b >> 32) as u32) as usize
 }
 
 struct Inner<T> {
@@ -210,7 +200,7 @@ impl<T> Inner<T> {
 
   // This is safe so long as only called from one thread (the owner of SwapQueue)
   unsafe fn push(self: &Arc<Self>, task: T) -> Option<Stealer<T>> {
-    let slot = self.slot.fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
+    let slot = self.slot.fetch_add(WRITE_IN_PROGRESS, Ordering::Relaxed);
     let buffer_cell = self.buffer(&slot);
 
     // Buffer was stolen or hasn't been initialized
@@ -222,7 +212,7 @@ impl<T> Inner<T> {
 
       *self.base_slot.get() = slot;
 
-      self.slot.fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
+      self.slot.fetch_add(WRITE_IN_PROGRESS, Ordering::Relaxed);
 
       Some(Stealer::new(slot, self.clone()))
     } else {
@@ -231,7 +221,7 @@ impl<T> Inner<T> {
       self.resize_if_necessary(&index, buffer_cell);
       (*buffer_cell.get()).assume_init_ref().write(index, task);
 
-      let slot = self.slot.fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
+      let slot = self.slot.fetch_add(WRITE_IN_PROGRESS, Ordering::Relaxed);
 
       match (slot ^ &*self.base_slot.get()) & (LANE | RECLAMATION_PHASE) {
         // Stealer dropped
@@ -471,7 +461,7 @@ mod tests {
 
   #[test]
   fn slot_wraps_around() {
-    let delta = slot_delta(&(1 << LENGTH_SHIFT), &usize::MAX);
+    let delta = slot_delta(&0, &((u32::MAX as usize) << 32));
 
     assert_eq!(delta, 1);
   }
