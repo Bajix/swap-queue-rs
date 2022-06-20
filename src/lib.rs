@@ -184,6 +184,80 @@ impl<T> Inner<T> {
   unsafe fn take_waker(&self) -> Waker {
     mem::replace(&mut *self.waker.get(), MaybeUninit::uninit()).assume_init()
   }
+
+  /// Resizes the internal buffer to the new capacity.
+  unsafe fn resize_if_necessary(
+    &self,
+    write_index: &usize,
+    buffer_cell: &UnsafeCell<MaybeUninit<Buffer<T>>>,
+  ) {
+    let current_cap = (*buffer_cell.get()).assume_init_ref().cap;
+
+    if current_cap.eq(write_index) {
+      // Allocate a new buffer and copy data from the old buffer to the new one.
+      let new = Buffer::alloc(current_cap * 2);
+
+      let buffer: &mut Buffer<T> = { (*buffer_cell.get()).assume_init_mut() };
+
+      ptr::copy_nonoverlapping(buffer.at(0), new.at(0), current_cap);
+
+      let old = mem::replace(buffer, new);
+
+      // Here we're deallocating the old buffer without dropping individual items as the new buffer is now owner
+      old.dealloc();
+    }
+  }
+
+  // This is safe so long as only called from one thread (the owner of SwapQueue)
+  unsafe fn push(self: &Arc<Self>, task: T) -> Option<Stealer<T>> {
+    let slot = self.slot.fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
+    let buffer_cell = self.buffer(&slot);
+
+    // Buffer was stolen or hasn't been initialized
+    if ((slot ^ &*self.base_slot.get()) & LANE).eq(&LANE) {
+      let buffer = Buffer::alloc(MIN_CAP);
+
+      buffer.write(0, task);
+      buffer_cell.get().write(MaybeUninit::new(buffer));
+
+      *self.base_slot.get() = slot;
+
+      self.slot.fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
+
+      Some(Stealer::new(slot, self.clone()))
+    } else {
+      let index = slot_delta(&slot, &*self.base_slot.get());
+
+      self.resize_if_necessary(&index, buffer_cell);
+      (*buffer_cell.get()).assume_init_ref().write(index, task);
+
+      let slot = self.slot.fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
+
+      match (slot ^ &*self.base_slot.get()) & (LANE | RECLAMATION_PHASE) {
+        // Stealer dropped
+        DROP_BUFFER => {
+          let buffer = mem::replace(&mut *buffer_cell.get(), MaybeUninit::uninit()).assume_init();
+
+          // Go through the buffer from front to back and drop all tasks in the queue.
+          for i in 0..index {
+            buffer.at(i).drop_in_place();
+          }
+
+          // Free the memory allocated by the buffer.
+          buffer.dealloc();
+
+          None
+        }
+        // Stealer waiting to wake / take
+        LANE => {
+          self.take_waker().wake();
+
+          None
+        }
+        _ => None,
+      }
+    }
+  }
 }
 
 /// A thread-owned worker queue that writes to a swappable buffer using atomic slotting
@@ -245,89 +319,9 @@ impl<T: Sized> SwapQueue<T> {
     }
   }
 
-  /// Resizes the internal buffer to the new capacity.
-  unsafe fn resize_if_necessary(
-    &self,
-    write_index: &usize,
-    buffer_cell: &UnsafeCell<MaybeUninit<Buffer<T>>>,
-  ) {
-    let current_cap = (*buffer_cell.get()).assume_init_ref().cap;
-
-    if current_cap.eq(write_index) {
-      // Allocate a new buffer and copy data from the old buffer to the new one.
-      let new = Buffer::alloc(current_cap * 2);
-
-      let buffer: &mut Buffer<T> = { (*buffer_cell.get()).assume_init_mut() };
-
-      ptr::copy_nonoverlapping(buffer.at(0), new.at(0), current_cap);
-
-      let old = mem::replace(buffer, new);
-
-      // Here we're deallocating the old buffer without dropping individual items as the new buffer is now owner
-      old.dealloc();
-    }
-  }
-
   /// Write to the next slot, swapping buffers as necessary and returning a Stealer at the start of a new batch
   pub fn push(&self, task: T) -> Option<Stealer<T>> {
-    let inner = self.inner.as_ref();
-    let slot = inner.slot.fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
-    let buffer_cell = inner.buffer(&slot);
-
-    // Buffer was stolen or hasn't been initialized
-    if ((slot ^ unsafe { &*inner.base_slot.get() }) & LANE).eq(&LANE) {
-      let buffer = Buffer::alloc(MIN_CAP);
-
-      unsafe {
-        buffer.write(0, task);
-        buffer_cell.get().write(MaybeUninit::new(buffer));
-      }
-
-      unsafe {
-        *inner.base_slot.get() = slot;
-      }
-
-      inner.slot.fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
-
-      Some(Stealer::new(slot, self.inner.clone()))
-    } else {
-      let index = slot_delta(&slot, unsafe { &*inner.base_slot.get() });
-
-      unsafe {
-        self.resize_if_necessary(&index, buffer_cell);
-        (*buffer_cell.get()).assume_init_ref().write(index, task);
-      }
-
-      let slot = inner.slot.fetch_add(1 << FLAGS_SHIFT, Ordering::Relaxed);
-
-      match (slot ^ unsafe { &*inner.base_slot.get() }) & (LANE | RECLAMATION_PHASE) {
-        // Stealer dropped
-        DROP_BUFFER => {
-          unsafe {
-            let buffer = mem::replace(&mut *buffer_cell.get(), MaybeUninit::uninit()).assume_init();
-
-            // Go through the buffer from front to back and drop all tasks in the queue.
-            for i in 0..index {
-              buffer.at(i).drop_in_place();
-            }
-
-            // Free the memory allocated by the buffer.
-            buffer.dealloc();
-          }
-
-          None
-        }
-        // Stealer waiting to wake / take
-        LANE => {
-          unsafe {
-            inner.take_waker().wake();
-          }
-
-          None
-        }
-        _ => None,
-      }
-    }
+    unsafe { self.inner.push(task) }
   }
 }
 
