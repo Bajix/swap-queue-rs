@@ -113,14 +113,13 @@ impl<T> Buffer<T> {
 
   /// Returns a pointer to the task at the specified `index`.
   #[inline]
-  unsafe fn at(&self, index: usize) -> *mut T {
-    // `self.cap` is always a power of two.
-    self.ptr.offset((index & (self.cap - 1)) as isize)
+  unsafe fn at(&self, index: isize) -> *mut T {
+    self.ptr.offset(index)
   }
 
   /// Writes `task` into the specified `index`.
   #[inline]
-  unsafe fn write(&self, index: usize, task: T) {
+  unsafe fn write(&self, index: isize, task: T) {
     ptr::write_volatile(self.at(index), task)
   }
 
@@ -176,26 +175,20 @@ impl<T> Inner<T> {
   }
 
   /// Resizes the internal buffer to the new capacity.
-  unsafe fn resize_if_necessary(
-    &self,
-    write_index: &usize,
-    buffer_cell: &UnsafeCell<MaybeUninit<Buffer<T>>>,
-  ) {
+  unsafe fn resize_buffer(&self, buffer_cell: &UnsafeCell<MaybeUninit<Buffer<T>>>) {
     let current_cap = (*buffer_cell.get()).assume_init_ref().cap;
 
-    if current_cap.eq(write_index) {
-      // Allocate a new buffer and copy data from the old buffer to the new one.
-      let new = Buffer::alloc(current_cap * 2);
+    // Allocate a new buffer and copy data from the old buffer to the new one.
+    let new = Buffer::alloc(current_cap * 2);
 
-      let buffer: &mut Buffer<T> = { (*buffer_cell.get()).assume_init_mut() };
+    let buffer: &mut Buffer<T> = { (*buffer_cell.get()).assume_init_mut() };
 
-      ptr::copy_nonoverlapping(buffer.at(0), new.at(0), current_cap);
+    ptr::copy_nonoverlapping(buffer.at(0), new.at(0), current_cap);
 
-      let old = mem::replace(buffer, new);
+    let old = mem::replace(buffer, new);
 
-      // Here we're deallocating the old buffer without dropping individual items as the new buffer is now owner
-      old.dealloc();
-    }
+    // Here we're deallocating the old buffer without dropping individual items as the new buffer is now owner
+    old.dealloc();
   }
 
   // This is safe so long as only called from one thread (the owner of SwapQueue)
@@ -218,8 +211,13 @@ impl<T> Inner<T> {
     } else {
       let index = slot_delta(&slot, &*self.base_slot.get());
 
-      self.resize_if_necessary(&index, buffer_cell);
-      (*buffer_cell.get()).assume_init_ref().write(index, task);
+      if index >= 64 && index & (index - 1) == 0 {
+        self.resize_buffer(buffer_cell);
+      }
+
+      (*buffer_cell.get())
+        .assume_init_ref()
+        .write(index as isize, task);
 
       let slot = self.slot.fetch_add(WRITE_IN_PROGRESS, Ordering::Relaxed);
 
@@ -230,7 +228,7 @@ impl<T> Inner<T> {
 
           // Go through the buffer from front to back and drop all tasks in the queue.
           for i in 0..index {
-            buffer.at(i).drop_in_place();
+            buffer.at(i as isize).drop_in_place();
           }
 
           // Free the memory allocated by the buffer.
@@ -321,12 +319,6 @@ impl<T> Default for SwapQueue<T> {
   }
 }
 
-impl<T> fmt::Debug for SwapQueue<T> {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.pad("SwapQueue { .. }")
-  }
-}
-
 pub enum State {
   Uninitialized,
   Pending { slot: usize },
@@ -371,6 +363,7 @@ impl<T> Future for Stealer<T> {
         unsafe {
           self.get_unchecked_mut().state = State::Received;
         }
+
         Poll::Ready(value)
       }
       State::Uninitialized => {
@@ -436,7 +429,7 @@ impl<T> Drop for Stealer<T> {
 
             // Go through the buffer from front to back and drop all tasks in the queue.
             for i in 0..index {
-              buffer.at(i).drop_in_place();
+              buffer.at(i as isize).drop_in_place();
             }
 
             // Free the memory allocated by the buffer.
