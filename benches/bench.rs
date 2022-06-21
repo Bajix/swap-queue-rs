@@ -258,7 +258,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     );
 
     push_tests.bench_with_input(
-      BenchmarkId::new("swap-queue-v1.0.0", batch_size),
+      BenchmarkId::new("swap-queue-v1.0.1", batch_size),
       &batch_size,
       |b, batch_size| {
         b.iter_batched(
@@ -352,7 +352,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     );
 
     take_tests.bench_with_input(
-      BenchmarkId::new("swap-queue-v1.0.0", batch_size),
+      BenchmarkId::new("swap-queue-v1.0.1", batch_size),
       &batch_size,
       |b, batch_size| {
         b.to_async(&rt).iter_batched(
@@ -461,7 +461,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     );
 
     async_batching_tests.bench_with_input(
-      BenchmarkId::new("swap-queue-v1.0.0", batch_size),
+      BenchmarkId::new("swap-queue-v1.0.1", batch_size),
       &batch_size,
       |b, batch_size| {
         b.to_async(&rt)
