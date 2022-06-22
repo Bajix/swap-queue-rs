@@ -15,7 +15,7 @@ mod bench_swap_queue {
   };
 
   thread_local! {
-    static QUEUE: SwapQueue<(u64, Sender<u64>)> = SwapQueue::new();
+    static QUEUE: SwapQueue<(u64, Sender<u64>), 64> = SwapQueue::new();
   }
 
   async fn push_echo(i: u64) -> u64 {
@@ -247,7 +247,7 @@ fn criterion_benchmark(c: &mut Criterion) {
       |b, batch_size| {
         b.iter_batched(
           || swap_queue::SwapQueue::new(),
-          |queue| {
+          |queue: swap_queue::SwapQueue<u64, 64>| {
             for i in 0..*batch_size {
               queue.push(i);
             }
@@ -337,7 +337,7 @@ fn criterion_benchmark(c: &mut Criterion) {
       |b, batch_size| {
         b.to_async(&rt).iter_batched(
           || {
-            let worker = swap_queue::SwapQueue::new();
+            let worker: swap_queue::SwapQueue<u64, 64> = swap_queue::SwapQueue::new();
             let stealer = worker.push(0).unwrap();
             for i in 1..*batch_size {
               worker.push(i);
