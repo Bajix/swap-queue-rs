@@ -1,4 +1,4 @@
-use super::buffer::{Buffer, MIN_CAP};
+use super::buffer::Buffer;
 use cache_padded::CachePadded;
 use std::{
   cell::UnsafeCell,
@@ -16,6 +16,13 @@ unsafe impl<T: Send> Send for Inner<T> {}
 unsafe impl<T: Send> Sync for Inner<T> {}
 
 impl<T> Inner<T> {
+  pub(super) fn from_slot(slot: CachePadded<AtomicUsize>) -> Self {
+    Inner {
+      slot,
+      buffer: UnsafeCell::new(Buffer::alloc(0)),
+    }
+  }
+
   /// Write to offset without checking offset
   pub(super) unsafe fn write_unchecked(&self, offset: isize, task: T) {
     ptr::write((*self.buffer.get()).at(offset), task);
@@ -24,7 +31,7 @@ impl<T> Inner<T> {
   /// Resize to double previous allocated capacity
   pub(super) unsafe fn resize_doubled(&self) {
     let buffer = &mut *self.buffer.get();
-    let new = Buffer::alloc(buffer.cap * 2);
+    let new = Buffer::alloc(buffer.cap << 1);
 
     ptr::copy_nonoverlapping(buffer.at(0), new.at(0), buffer.cap);
 
@@ -42,7 +49,7 @@ impl<T> Inner<T> {
 
 impl<T> From<T> for Inner<T> {
   fn from(task: T) -> Self {
-    let buffer = Buffer::alloc(MIN_CAP);
+    let buffer = Buffer::alloc(1);
     unsafe {
       buffer.write(0, task);
     }

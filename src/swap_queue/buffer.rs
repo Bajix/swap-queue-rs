@@ -6,9 +6,6 @@ use std::{mem, ptr};
 /// *not* deallocate the buffer.
 ///
 
-// Minimum buffer capacity.
-pub(super) const MIN_CAP: usize = 64;
-
 pub(super) struct Buffer<T> {
   /// Pointer to the allocated memory.
   ptr: *mut T,

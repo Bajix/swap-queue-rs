@@ -1,7 +1,12 @@
-use super::{buffer::MIN_CAP, inner::Inner, stealer::Stealer};
+use cache_padded::CachePadded;
+
+use super::{inner::Inner, stealer::Stealer};
 use std::{
   cell::RefCell,
-  sync::{atomic::Ordering, Arc, Weak},
+  sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+  },
 };
 
 // Indicate that buffer has been taken
@@ -11,7 +16,7 @@ pub(super) const BUFFER_TAKEN: usize = 1 << 0;
 pub(super) const WRITE_IN_PROGRESS: usize = 1 << 31;
 
 pub struct SwapQueue<T: Send + Sized> {
-  inner: RefCell<Weak<Inner<T>>>,
+  inner: RefCell<Arc<Inner<T>>>,
 }
 
 impl<T: Send + Sized> SwapQueue<T> {
@@ -26,26 +31,38 @@ impl<T: Send + Sized> SwapQueue<T> {
   /// ```
   pub fn new() -> SwapQueue<T> {
     SwapQueue {
-      inner: RefCell::new(Weak::new()),
+      inner: RefCell::new(Arc::new(Inner::from_slot(CachePadded::new(
+        AtomicUsize::new(BUFFER_TAKEN),
+      )))),
     }
   }
 
-  fn inner(&self) -> Option<Arc<Inner<T>>> {
-    self.inner.borrow().upgrade()
+  fn with_inner<F: FnOnce(&Inner<T>) -> O, O>(&self, map_fn: F) -> O {
+    map_fn(self.inner.borrow().as_ref())
   }
+
+  // fn with_inner_mut<O>(&self, map_fn: fn(&mut Arc<Inner<T>>) -> O) -> O {
+  //   map_fn(&mut *self.inner.borrow_mut())
+  // }
+
+  // fn replace_inner(&self, new: Arc<Inner<T>>) {
+  //   self.with_inner_mut(|inner| {
+  //     // mem::replace(&mut inner, new);
+  //   });
+  // }
 
   /// Write to the next slot, returning a Stealer at the start of a new batch
   pub fn push(&self, task: T) -> Option<Stealer<T>> {
-    if let Some(inner) = self.inner() {
-      let slot = inner.slot.fetch_add(WRITE_IN_PROGRESS, Ordering::Relaxed);
+    let slot = self.with_inner(|inner| inner.slot.fetch_add(WRITE_IN_PROGRESS, Ordering::Relaxed));
 
-      if (slot & BUFFER_TAKEN).eq(&BUFFER_TAKEN) {
-        let inner: Arc<Inner<T>> = Arc::new(task.into());
-        self.inner.replace(Arc::downgrade(&inner));
-        Some(inner.into())
-      } else {
+    if (slot & BUFFER_TAKEN).eq(&BUFFER_TAKEN) {
+      let inner: Arc<Inner<T>> = Arc::new(task.into());
+      self.inner.replace(inner.clone());
+      Some(inner.into())
+    } else {
+      self.with_inner(move |inner| {
         let index = slot >> 32;
-        if (index & (index - 1)).eq(&0) && index >= MIN_CAP {
+        if (index & index - 1).eq(&0) {
           unsafe {
             inner.resize_doubled();
           }
@@ -58,11 +75,7 @@ impl<T: Send + Sized> SwapQueue<T> {
         inner.slot.fetch_add(WRITE_IN_PROGRESS, Ordering::Relaxed);
 
         None
-      }
-    } else {
-      let inner: Arc<Inner<T>> = Arc::new(task.into());
-      self.inner.replace(Arc::downgrade(&inner));
-      Some(inner.into())
+      })
     }
   }
 }
