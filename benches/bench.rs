@@ -1,6 +1,5 @@
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, SamplingMode};
 use std::time::Duration;
-
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use tokio::runtime::Builder;
 
 #[global_allocator]
@@ -8,14 +7,14 @@ static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 mod bench_swap_queue {
   use futures::future::join_all;
-  use swap_queue::Worker;
+  use swap_queue::SwapQueue;
   use tokio::{
     runtime::Handle,
     sync::oneshot::{channel, Sender},
   };
 
   thread_local! {
-    static QUEUE: Worker<(u64, Sender<u64>)> = Worker::new();
+    static QUEUE: SwapQueue<(u64, Sender<u64>)> = SwapQueue::new();
   }
 
   async fn push_echo(i: u64) -> u64 {
@@ -25,7 +24,7 @@ mod bench_swap_queue {
       QUEUE.with(|queue| {
         if let Some(stealer) = queue.push((i, tx)) {
           Handle::current().spawn(async move {
-            let batch = stealer.take().await;
+            let batch = stealer.await;
 
             batch.into_iter().for_each(|(i, tx)| {
               tx.send(i).ok();
@@ -235,18 +234,19 @@ fn criterion_benchmark(c: &mut Criterion) {
   let rt = Builder::new_current_thread().build().unwrap();
 
   let mut push_tests = c.benchmark_group("Push");
-  push_tests.warm_up_time(Duration::from_millis(10));
-  push_tests.measurement_time(Duration::from_secs(1));
-  push_tests.sample_size(50);
+  push_tests.sampling_mode(SamplingMode::Linear);
+  push_tests.warm_up_time(Duration::from_secs(1));
+  push_tests.measurement_time(Duration::from_secs(5));
+  push_tests.sample_size(20);
 
-  for n in 0..=12 {
+  for n in 0..=10 {
     let batch_size: u64 = 1 << n;
     push_tests.bench_with_input(
       BenchmarkId::new("swap-queue", batch_size),
       &batch_size,
       |b, batch_size| {
         b.iter_batched(
-          || swap_queue::Worker::new(),
+          || swap_queue::SwapQueue::new(),
           |queue| {
             for i in 0..*batch_size {
               queue.push(i);
@@ -325,9 +325,10 @@ fn criterion_benchmark(c: &mut Criterion) {
   push_tests.finish();
 
   let mut take_tests = c.benchmark_group("Take");
-  take_tests.warm_up_time(Duration::from_millis(10));
-  take_tests.measurement_time(Duration::from_secs(1));
-  take_tests.sample_size(50);
+  take_tests.sampling_mode(SamplingMode::Linear);
+  take_tests.warm_up_time(Duration::from_secs(1));
+  take_tests.measurement_time(Duration::from_secs(5));
+  take_tests.sample_size(20);
 
   for n in 0..=12 {
     let batch_size: u64 = 1 << n;
@@ -335,9 +336,9 @@ fn criterion_benchmark(c: &mut Criterion) {
       BenchmarkId::new("swap-queue", batch_size),
       &batch_size,
       |b, batch_size| {
-        b.iter_batched(
+        b.to_async(&rt).iter_batched(
           || {
-            let worker = swap_queue::Worker::new();
+            let worker = swap_queue::SwapQueue::new();
             let stealer = worker.push(0).unwrap();
             for i in 1..*batch_size {
               worker.push(i);
@@ -345,7 +346,7 @@ fn criterion_benchmark(c: &mut Criterion) {
 
             stealer
           },
-          |stealer| stealer.take_blocking(),
+          |stealer| async move { stealer.await },
           BatchSize::PerIteration,
         );
       },
@@ -444,9 +445,10 @@ fn criterion_benchmark(c: &mut Criterion) {
   take_tests.finish();
 
   let mut async_batching_tests = c.benchmark_group("Batching");
-  async_batching_tests.warm_up_time(Duration::from_millis(10));
-  async_batching_tests.measurement_time(Duration::from_secs(1));
-  async_batching_tests.sample_size(50);
+  async_batching_tests.sampling_mode(SamplingMode::Linear);
+  async_batching_tests.warm_up_time(Duration::from_secs(1));
+  async_batching_tests.measurement_time(Duration::from_secs(5));
+  async_batching_tests.sample_size(20);
 
   for n in 0..=12 {
     let batch_size: u64 = 1 << n;
